@@ -94,6 +94,9 @@ class Database:
                       PRIMARY KEY(event_id,url), FOREIGN KEY(event_id) REFERENCES events(id));
                     INSERT INTO sources SELECT * FROM sources_v1 WHERE event_id IS NOT NULL;
                     DROP TABLE sources_v1;''')
+            if not any(row['name'] == 'attempted_at' for row in db.execute('PRAGMA table_info(sources)')):
+                db.execute("ALTER TABLE sources ADD COLUMN attempted_at TEXT")
+                db.execute("UPDATE sources SET attempted_at=fetched_at")
 
     def upsert_event(self, item: dict[str, Any]) -> None:
         stamp = now()
@@ -121,6 +124,7 @@ class Database:
                 ON CONFLICT(event_id,url) DO UPDATE SET content_hash=excluded.content_hash,
                 fetched_at=excluded.fetched_at,parser=excluded.parser,quality='verified',error=NULL""",
                 (source_url, event_id, content_hash, stamp, parser))
+            db.execute('UPDATE sources SET attempted_at=? WHERE event_id=? AND url=?', (stamp, event_id, source_url))
             if not changed:
                 return False
             db.execute("INSERT OR IGNORE INTO revisions(source_url,content_hash,observed_at,summary) VALUES(?,?,?,?)",
@@ -128,7 +132,8 @@ class Database:
             # Replacing records from this exact source keeps IDs stable across deadline changes.
             tickets, performances, cast = list(tickets), list(performances), list(cast)
             db.execute("DELETE FROM ticket_rounds WHERE event_id=?", (event_id,))
-            db.execute("DELETE FROM performances WHERE event_id=? AND (status!='directory' OR ?)", (event_id, bool(performances)))
+            if performances:
+                db.execute("DELETE FROM performances WHERE event_id=?", (event_id,))
             db.execute("DELETE FROM cast_appearances WHERE event_id=?", (event_id,))
             for row in tickets:
                 evidence = row.evidence
@@ -156,6 +161,7 @@ class Database:
             db.execute("""INSERT INTO sources(url,event_id,fetched_at,parser,quality,error) VALUES(?,?,?,'fetch','stale',?)
               ON CONFLICT(event_id,url) DO UPDATE SET quality='stale',error=excluded.error""",
               (url, event_id, now(), error[:500]))
+            db.execute('UPDATE sources SET attempted_at=? WHERE event_id=? AND url=?', (now(), event_id, url))
 
     def list_events(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as db:
@@ -168,7 +174,11 @@ class Database:
         with self._connect() as db:
             rows = db.execute("""SELECT e.* FROM events e LEFT JOIN sources s ON s.event_id=e.id AND s.url=e.official_url
                 WHERE e.official_url LIKE 'https://idolmaster-official.jp/live_event/%'
-                ORDER BY COALESCE(s.fetched_at,''), e.source_updated DESC LIMIT ?""", (limit,)).fetchall()
+                ORDER BY CASE WHEN EXISTS(SELECT 1 FROM performances p WHERE p.event_id=e.id AND p.date>=date('now'))
+                    OR NOT EXISTS(SELECT 1 FROM performances p WHERE p.event_id=e.id)
+                    OR EXISTS(SELECT 1 FROM ticket_rounds t WHERE t.event_id=e.id AND t.application_end>=date('now'))
+                    THEN 0 ELSE 1 END,
+                    COALESCE(s.attempted_at,''), e.source_updated DESC LIMIT ?""", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
     def save_directory_dates(self, event_id: str, rows: list[Performance]) -> None:

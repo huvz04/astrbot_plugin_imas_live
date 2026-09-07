@@ -1,0 +1,25 @@
+{
+  "data": {
+    "article_list": [
+      {
+        "_id": "23293",
+        "title": "THE IDOLM@STER CINDERELLA GIRLS × MILLION LIVE! CLASH M@TCH!!",
+        "brand": [
+          {
+            "name": "シンデレラガールズ",
+            "code": "CINDERELLAGIRLS"
+          },
+          {
+            "name": "ミリオンライブ！",
+            "code": "MILLIONLIVE"
+          }
+        ],
+        "article_type": "url_link",
+        "event_url": "https://idolmaster-official.jp/live_event/deremilli_clashmatch/",
+        "event_dspdate": "2027年2月27日(土)　開場15:30 / 開演17:00（予定）\n2027年2月28日(日)　開場15:30 / 開演17:00（予定）",
+        "event_place": "IGアリーナ",
+        "updated": 1787714402
+      }
+    ]
+  }
+}

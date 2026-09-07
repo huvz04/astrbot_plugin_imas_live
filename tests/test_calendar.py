@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
@@ -41,16 +42,19 @@ class CalendarTests(unittest.TestCase):
             visible_center = text_top + (bbox[1] + bbox[3]) / 2
             self.assertAlmostEqual(visible_center, 35, delta=0.5)
 
-    def test_brand_pill_uses_symmetric_horizontal_padding(self):
+    def test_many_same_day_entries_paginate_without_losing_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
             renderer = CalendarRenderer(Path(tmp))
-            draw = ImageDraw.Draw(Image.new("RGB", (100, 100)))
-            font = renderer.font(18, True)
-            gakuen_width = round(draw.textlength("Gakuen", font=font))
-            side_m_width = round(draw.textlength("SideM", font=font))
-            self.assertEqual(gakuen_width + 32 - gakuen_width, 32)
-            self.assertEqual(side_m_width + 32 - side_m_width, 32)
-            self.assertLess(side_m_width + 32, 112)
+            now = datetime(2026, 9, 8, tzinfo=ZoneInfo('Asia/Shanghai'))
+            rows = [{'kind': 'performance', 'display_date': '2026-09-08', 'title': f'演出 {i}',
+                     'subtitle': '场次示例', 'brands': ['SIDEM']} for i in range(25)]
+            with patch.object(renderer, '_draw_card', wraps=renderer._draw_card) as draw_card:
+                paths = renderer.render_calendar(rows, now.date(), now.date(), now, '测试')
+            self.assertEqual(draw_card.call_count, 25)
+            self.assertGreater(len(paths), 1)
+            for path in paths:
+                with Image.open(path) as image:
+                    self.assertLessEqual(image.height, 1840)
 
     def test_group_switch_persists_and_blocks_only_that_group(self):
         with tempfile.TemporaryDirectory() as tmp:

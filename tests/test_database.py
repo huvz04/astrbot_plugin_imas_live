@@ -17,5 +17,5 @@ class DatabaseTests(unittest.TestCase):
             self.assertTrue(db.save_parsed("cms-1", "https://example.test/ticket", "hash-2", "test", [ticket("2026-09-11T23:59+09:00")], [], [], []))
             rows = db.tickets()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["id"], "round-stable")
+            self.assertEqual(rows[0]["id"], "cms-1:round-stable")
             self.assertEqual(rows[0]["application_end"], "2026-09-11T23:59+09:00")

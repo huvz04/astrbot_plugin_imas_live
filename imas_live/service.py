@@ -31,6 +31,7 @@ class ImasLiveService:
         self.db.recover_deliveries()
         self.client = OfficialCmsClient(float(self.config.get("request_timeout_seconds", 25)))
         self._sync_lock = asyncio.Lock()
+        self.directory_ready = asyncio.Event()
 
     async def close(self) -> None:
         await self.client.close()
@@ -64,6 +65,8 @@ class ImasLiveService:
                     dates = schedule_performances(article.event_display or '', article.url or f'https://idolmaster-official.jp/live_event#event-{article.cms_id}', article.venue, True) if is_live and not excluded else []
                     await asyncio.to_thread(self.db.save_directory_dates, article.cms_id, dates)
             if full_directory:
+                self.db.set_meta('last_directory_sync', datetime.now(timezone.utc).isoformat(timespec='seconds'))
+                self.directory_ready.set()
                 known = await asyncio.to_thread(self.db.fetchable_events, max(1, int(self.config.get('max_special_pages', 12))))
                 articles = [CmsArticle(row['id'], row['title'], row['official_url'], json.loads(row['brands_json']), row['event_display'], row['venue'], row['source_updated'], {}) for row in known]
             changed, failed = 0, 0
@@ -84,7 +87,9 @@ class ImasLiveService:
                     failed += 1; await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self.db.set_meta("last_successful_sync", stamp)
-            self.db.set_meta('last_error', f'{failed} 个专题核验失败' if failed else '')
+            with self.db._connect() as db:
+                unverified = db.execute("SELECT COUNT(*) FROM sources WHERE quality='stale'").fetchone()[0]
+            self.db.set_meta('last_error', f'{unverified} 个专题待核验' if unverified else '')
             first = self.db.meta("baseline_complete") is None
             self.db.set_meta("baseline_complete", "1")
             return {"status": "ok", "events": len(articles), "changed_pages": changed, "failed_pages": failed, "baseline": first}
@@ -114,10 +119,11 @@ class ImasLiveService:
                         queue.insert(0, destination)
                         break
             parsed = parse_ticket_page(html, url)
+            result.review_notes.extend(parsed.review_notes)
             for row in parsed.ticket_rounds:
                 ticket_rows[row.stable_key] = row
             performances = parse_information(html, url)
-            if performances:
+            if performances and (not result.performances or '/information' in url):
                 result.performances = performances
             if '283production_msp' in root:
                 cast_data = parse_shiny_information(html, url)
@@ -229,7 +235,7 @@ class ImasLiveService:
             except ValueError:
                 continue
             if start.date() <= display_day <= end.date():
-                venue = row["venue"] or row["event_venue"] or "场馆待核验"
+                venue = clean(row["venue"] or row["event_venue"] or "场馆待核验")
                 session = row["session_label"] or "场次待核验"
                 entries.append({"kind": "performance", "display_date": row["date"], "title": row["title"],
                                 "subtitle": f"{session}｜{venue}", "brands": json.loads(row["brands_json"]), "url": row["source_url"]})
@@ -244,13 +250,14 @@ class ImasLiveService:
                 entries.append({"kind": "deadline", "display_date": local.date().isoformat(), "title": row["title"],
                                 "subtitle": f"{row['name']}｜{text}", "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"]})
         entries.sort(key=lambda item: (item["display_date"], item["kind"] != "deadline", item["title"]))
-        last = self.db.meta("last_successful_sync")
+        last = self.db.meta("last_directory_sync") or self.db.meta('last_successful_sync')
         if not last:
             status = "尚未同步"
         else:
             try:
                 is_stale = current.astimezone(timezone.utc) - datetime.fromisoformat(last) > timedelta(hours=int(self.config.get("freshness_hours", 12)))
-                status = ("缓存陈旧｜" if is_stale else "上次核验 ") + last
+                local_stamp = datetime.fromisoformat(last).astimezone(zone)
+                status = ("缓存陈旧｜" if is_stale else "目录更新 ") + local_stamp.strftime('%Y/%m/%d %H:%M')
             except ValueError:
                 status = "核验时间格式异常"
         error = self.db.meta('last_error')

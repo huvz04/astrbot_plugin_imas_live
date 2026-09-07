@@ -138,11 +138,11 @@ class CalendarRenderer:
         image.save(path, "PNG", optimize=True)
         # Only our own aged render files are eligible for cleanup.
         for old in self.output_dir.glob("*.png"):
-            if old.name.startswith(("calendar-", "deadline-")) and time.time() - old.stat().st_mtime > 7 * 86400:
-                try:
+            try:
+                if old.name.startswith(("calendar-", "deadline-")) and time.time() - old.stat().st_mtime > 7 * 86400:
                     old.unlink()
-                except OSError:
-                    pass
+            except OSError:
+                pass
         return path
 
     def render_calendar(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime, status: str = "") -> list[Path]:
@@ -157,10 +157,12 @@ class CalendarRenderer:
                 current, used = [], 190
                 card["title"], card["sub"] = card["title"][12:], card["sub"][12:]
                 card["height"] = 48 + 30 * len(card["labels"]) + 39 * len(card["title"]) + 31 * len(card["sub"])
-            needed = 62 + card["height"]
+            new_day = not current or current[-1][0] != entry['display_date']
+            needed = 16 + card["height"] + (46 if new_day else 0)
             if current and used + needed + 110 > 1840:
                 pages.append(current)
                 current, used = [], 190
+                needed = 62 + card['height']
             current.append((entry["display_date"], card))
             used += needed
         if current or not pages:
@@ -168,7 +170,8 @@ class CalendarRenderer:
         output = []
         zone = "北京时间" if str(generated_at.tzinfo) == "Asia/Shanghai" else str(generated_at.tzinfo)
         for index, page in enumerate(pages, 1):
-            height = max(620, 190 + sum(card["height"] + 62 for _, card in page) + 110)
+            height = max(620, 190 + sum(card['height'] + 16 + (46 if i == 0 or page[i-1][0] != day else 0)
+                                      for i, (day, card) in enumerate(page)) + 110)
             image = Image.new("RGB", (self.width, height), "#f5f7fb")
             draw = ImageDraw.Draw(image)
             draw.rectangle((0, 0, self.width, 154), fill="#172033")
@@ -176,13 +179,17 @@ class CalendarRenderer:
             draw.text((48, 92), f"{zone} {start:%Y.%m.%d} — {end:%Y.%m.%d}", font=self.font(26), fill="#c8d3e6")
             y = 182
             if not page:
-                draw.text((48, 246), "这 30 天内暂无已收录的演出或抽票截止。", font=self.font(30, True), fill="#25324a")
+                message = '数据尚未同步完成，请稍后再发送 /imaslive。' if '尚未同步' in status else '这 30 天内暂无已收录的演出或抽票截止。'
+                draw.text((48, 246), message, font=self.font(30, True), fill="#25324a")
+            last_day = None
             for day, card in page:
                 value = date.fromisoformat(day)
                 weekday = "一二三四五六日"[value.weekday()]
                 marker = "今天" if value == start else ""
-                draw.text((48, y), f"{value:%m/%d} 周{weekday}  {marker}", font=self.font(30, True), fill="#263651")
-                y += 46
+                if day != last_day:
+                    draw.text((48, y), f"{value:%m/%d} 周{weekday}  {marker}", font=self.font(30, True), fill="#263651")
+                    y += 46
+                last_day = day
                 self._draw_card(draw, card, y)
                 y += card["height"] + 16
             footer = (status or "尚未同步") + f" ｜ {index}/{len(pages)}"

@@ -6,7 +6,7 @@
 /imaslive
 ```
 
-可附群开关参数：`/imaslive enable` 开启当前群，`/imaslive disable` 关闭当前群。状态按群 UMO 持久保存在插件数据库；关闭后该群不接收截止提醒、也不能输出日历，重启后仍生效。官网后台同步不受单个群开关影响。
+在 AstrBot 插件管理中使用仓库地址 `https://github.com/huvz04/astrbot_plugin_imas_live` 安装或更新。插件启动、安装和热重载后都会自动同步，第一次查询会等待活动目录就绪（最多 40 秒，后台同步继续运行）。未同步完成时图片会明确提示，不会把同步失败解释成没有活动。
 
 它会生成真实 PNG 图片，展示按北京时间从今天起 30 个自然日的纵向日期列表。演出日和已核验的现场抽选截止日分别进入同一滚动窗口：即使演出较远，只要抽选截止落在这 30 天内也会显示。
 
@@ -19,7 +19,7 @@
 - 同日昼夜场会各自保留；长标题自动换行，跨月有标记，多页会分页而不裁切或无限缩小字体。
 - 截止卡标出活动、轮次及含年份的北京时间。演出日期缺失或待核验时不会编造。
 - 没有记录时仍会生成清晰的空状态图片。
-- 本地 Pillow 渲染，默认尝试 Windows 的微软雅黑/游ゴシック；可以用 `font_path` 覆盖。无需浏览器和图像生成模型。
+- 本地 Pillow 渲染，自动寻找 Windows 微软雅黑/游ゴシック或 Linux Noto CJK/文泉驿。Linux/Docker 环境需要安装中日文字体，例如 Debian/Ubuntu 的 `fonts-noto-cjk`，也可将字体挂载到容器内并配置 `font_path`。无需浏览器。
 
 ## WebUI 配置
 
@@ -27,7 +27,7 @@
 
 | 配置 | 默认值 | 作用 |
 |---|---:|---|
-| `enabled` | `true` | 官网后台同步开关，也是未设置群开关时的默认群状态。 |
+| `enabled` | `true` | 官网后台同步与自动提醒总开关；查询仍可读取缓存。 |
 | `white_umos` | `[]` | 自动提醒的明确 UMO 白名单；空列表绝不发送。 |
 | `reminder_enabled` | `true` | 开关现场抽选截止提醒。 |
 | `reminder_before_minutes` | `60` | 距截止多少分钟进入提醒窗口。 |
@@ -41,24 +41,29 @@
 
 ## 来源与降级
 
-官网匿名 CMS 令牌仅在内存中使用，不写入日志或 SQLite。插件使用公开目录和可直接获取的专题页，并保存必要的结构化事实、短证据片段、内容 hash 与官方链接；失败时保留旧缓存。
+官网匿名 CMS 令牌仅在内存中使用，不写入日志或 SQLite。默认每 6 小时完整刷新活动目录，每小时轮换核验最多 12 个专题，并跟随专题内真实的日程、票务链接。当前及日期未明确的活动优先于已结束活动。目录中明确列举的演出日可先展示；连续日期范围不会擅自展开为每日演出。
+
+插件保存结构化事实、短证据片段、内容 hash 与官方链接。抓取失败保留旧缓存，并暂停该来源的提醒；其他来源成功不会使失败来源被当作最新数据。完整目录异常或分页不全也不会覆盖为成功空结果。初次目录就绪后，票务信息还会继续补齐。
 
 前端快照已核实 `detail_page → /live_events/{url_name}`、`lp_detail → /lp/{path}` 的公开跳转。动态新闻正文及上述动态路由的通用 CMS 正文接口尚未验证，因此不会猜测 `Content/get` 等端点；未能解析的来源保留为候选/待核验，而非虚构日期或截止时间。
 
 ## 本地验证与预览
 
-```powershell
-$env:PYTHONPATH = (Resolve-Path .\astrbot_plugin_imas_live).Path
-python -m unittest discover -s .\astrbot_plugin_imas_live\tests -v
+在仓库根目录运行（需 Python 3.10+ 和可用的中日文字体）：
+
+```text
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
 ```
 
-离线测试涵盖三种官方专题、30 天边界、远期演出的截止条目、合同色、空状态、长标题、60/30 分钟截止窗口、重启/重复检查去重、失败重试、白名单移除和截止改期版本。
+离线样本包含在 `tests/fixtures`。测试涵盖专题链接遍历、多段落多日演出、完整目录保存、令牌刷新、异常分页、首次查询等待、热重载、来源独立时效、30 天边界、图片排版和提醒去重/重试。
 
 已导出并视觉检查的 PNG 预览：
 
 - [普通日历](previews/normal-calendar.png)
+- [普通日历第 2 页](previews/normal-calendar-2.png)
 - [长标题、合同和跨月](previews/long-cross-month.png)
 - [空状态](previews/empty-calendar.png)
-- [截止提醒卡](previews/deadline-reminder.png)
+- [截止提醒卡](previews/deadline-reminder.png)（模拟进入截止前 60 分钟）
 
 没有真实 AstrBot/QQ 运行环境时，命令注册、真实图片发送和平台主动推送不被宣称为端到端已验证。

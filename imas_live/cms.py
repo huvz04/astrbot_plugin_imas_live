@@ -51,6 +51,10 @@ class OfficialCmsClient:
         for attempt in range(3):
             try:
                 response = await self.client.get(BASE + path, params=params)
+                if response.status_code == 401 and retry_token and attempt == 0:
+                    self._token = None
+                    params = {**params, 'token': await self.token()}
+                    continue
                 if response.status_code in (429, 500, 502, 503, 504):
                     if attempt == 2:
                         raise SourceUnavailable(f"官网临时不可用（HTTP {response.status_code}）")
@@ -58,16 +62,22 @@ class OfficialCmsClient:
                     continue
                 response.raise_for_status()
                 payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get('data'), dict):
+                    raise SourceUnavailable('官网 CMS 响应结构异常')
                 if payload.get("statusCode") != 200:
                     if retry_token and self._token and attempt == 0:
                         self._token = None
                         params = {**params, "token": await self.token()}
                         continue
                     raise SourceUnavailable("官网 CMS 返回业务错误；已保留上次成功数据。")
+                if payload['data'].get('apiStatus') is False:
+                    raise SourceUnavailable('官网 CMS 查询失败')
                 return payload
+            except (ValueError, TypeError):
+                raise SourceUnavailable('官网 CMS 返回了非预期内容') from None
             except httpx.HTTPError as exc:
                 if attempt == 2:
-                    raise SourceUnavailable("官网网络请求失败；已保留上次成功数据。") from exc
+                    raise SourceUnavailable("官网网络请求失败；已保留上次成功数据。") from None
                 await asyncio.sleep(min(8, 2 ** attempt))
         raise SourceUnavailable("官网请求失败")
 
@@ -108,24 +118,46 @@ class OfficialCmsClient:
         return token
 
     async def live_articles(self, max_pages: int = 30, page_size: int = 12) -> list[CmsArticle]:
-        token = await self.token()
+        await self.token()
         articles: list[CmsArticle] = []
         total: int | None = None
         for start in range(0, max_pages * page_size, page_size):
             data = json.dumps({"category": ["LIVE-EVENT"], "article_type": ["url_link", "detail_page"]}, ensure_ascii=False)
             payload = await self._get("idolmaster/Article/list", {
-                "site": "jp", "ip": "idolmaster", "token": token, "start": start,
+                "site": "jp", "ip": "idolmaster", "token": await self.token(), "start": start,
                 "limit": page_size, "data": data,
             })
             body = payload.get("data", {})
-            total = int(body.get("total_count", 0)) if total is None else total
+            try:
+                page_total = int(body['total_count'])
+            except (KeyError, ValueError, TypeError):
+                raise SourceUnavailable('活动目录总数异常') from None
+            if page_total < 0 or (total is not None and total != page_total):
+                raise SourceUnavailable('活动目录在分页期间发生变化，请稍后重试')
+            total = page_total
             batch = body.get("article_list", [])
-            if not isinstance(batch, list) or not batch:
+            if not isinstance(batch, list):
+                raise SourceUnavailable('活动目录结构异常')
+            if not batch:
+                if total and len(articles) < total:
+                    raise SourceUnavailable('活动目录分页意外为空；保留旧缓存')
                 break
-            articles.extend(self._article(item) for item in batch if isinstance(item, dict))
+            try:
+                if not all(isinstance(item, dict) for item in batch):
+                    raise TypeError
+                articles.extend(self._article(item) for item in batch)
+            except (ValueError, TypeError, AttributeError):
+                raise SourceUnavailable('活动目录条目结构异常') from None
             if start + len(batch) >= total or len(batch) < page_size:
                 break
-        return articles
+        if total and len(articles) < total:
+            raise SourceUnavailable('活动目录未完整获取，请检查 max_pages 或稍后重试')
+        unique = {item.cms_id: item for item in articles if item.cms_id and item.title}
+        if len(unique) != len(articles):
+            raise SourceUnavailable('活动目录 ID 缺失或分页重复；保留旧缓存')
+        if not unique:
+            raise SourceUnavailable('官网目录意外无记录，不能认证未来无活动')
+        return list(unique.values())
 
     @staticmethod
     def _article(item: dict[str, Any]) -> CmsArticle:

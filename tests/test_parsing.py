@@ -4,7 +4,7 @@ import unittest
 from imas_live.parsing import parse_shiny_information, parse_ticket_page, parse_venue
 
 
-SOURCES = Path(__file__).parents[2] / "research" / "imas-live" / "sources"
+SOURCES = Path(__file__).parent / "fixtures"
 
 
 def fixture(name: str) -> str:

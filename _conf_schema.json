@@ -1,5 +1,5 @@
 {
-  "enabled": {"description": "启用后台官网同步，也是未设置群开关时的默认状态", "type": "bool", "default": true},
+  "enabled": {"description": "启用后台官网同步与自动提醒", "type": "bool", "default": true},
   "sync_interval_minutes": {"description": "后台检查间隔（分钟）", "type": "int", "default": 60, "hint": "最低 15；首次同步只建立基线，不推送历史消息。"},
   "directory_interval_hours": {"description": "活动目录完整分页刷新间隔（小时）", "type": "int", "default": 6},
   "request_timeout_seconds": {"description": "官网请求超时（秒）", "type": "int", "default": 25},
@@ -9,7 +9,7 @@
   "white_umos": {"description": "允许自动截止提醒的 UMO 白名单", "type": "list", "default": [], "hint": "为空时不发送。格式如 aiocqhttp:GroupMessage:123456。"},
   "brands": {"description": "展示与提醒的企划代码筛选", "type": "list", "default": [], "hint": "为空表示所有已支持企划；例如 GAKUEN、SIDEM、SHINYCOLORS。"},
   "display_timezone": {"description": "图片主展示时区", "type": "string", "default": "Asia/Shanghai"},
-  "font_path": {"description": "图片字体文件路径（可选）", "type": "string", "default": "", "hint": "留空时自动寻找 Windows 中文/日文字体。"},
+  "font_path": {"description": "图片字体文件路径（可选）", "type": "string", "default": "", "hint": "自动寻找 Windows 中文字体或 Linux Noto CJK；容器需安装字体或配置容器内字体路径。"},
   "max_pages": {"description": "单次活动目录最大页数", "type": "int", "default": 30, "hint": "防止上游分页异常；当前官网样本约 15 页。"}
   ,"max_special_pages": {"description": "一次同步最多抓取的官方专题页数", "type": "int", "default": 12, "hint": "单域名串行限速；目录仍会完整保存为候选，后续轮换核验。"}
 }

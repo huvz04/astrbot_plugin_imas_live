@@ -27,7 +27,7 @@ class ImasLivePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context, config)
         self.context = context
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self.data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
         self.service = ImasLiveService(self.data_dir, self.config)
         self.renderer = CalendarRenderer(self.data_dir / "rendered", str(self.config.get("font_path", "")))
@@ -35,17 +35,19 @@ class ImasLivePlugin(Star):
         self._reminder_task: asyncio.Task | None = None
         self._last_directory = 0.0
 
-    @filter.on_astrbot_loaded()
-    async def on_astrbot_loaded(self):
-        self._sync_task = asyncio.create_task(self._sync_loop())
-        self._reminder_task = asyncio.create_task(self._reminder_loop())
+    async def initialize(self):
+        """Runs both on boot and WebUI install/reload; the global loaded event does not."""
+        if self._sync_task is None or self._sync_task.done():
+            self._sync_task = asyncio.create_task(self._sync_loop())
+        if self._reminder_task is None or self._reminder_task.done():
+            self._reminder_task = asyncio.create_task(self._reminder_loop())
 
     async def _sync_loop(self) -> None:
         while True:
             try:
                 interval = max(15, int(self.config.get("sync_interval_minutes", 60)))
                 directory_seconds = max(1, int(self.config.get("directory_interval_hours", 6))) * 3600
-                full = self.service.db.meta("baseline_complete") is None or time.monotonic() - self._last_directory >= directory_seconds
+                full = self._last_directory == 0.0 or self.service.db.meta("baseline_complete") is None or time.monotonic() - self._last_directory >= directory_seconds
                 if self.config.get("enabled", True):
                     result = await self.service.sync(full_directory=full)
                     if full and result.get("status") == "ok":
@@ -67,15 +69,17 @@ class ImasLivePlugin(Star):
                 for row in due:
                     by_umo[row["umo"]].append(row)
                 for umo, rows in by_umo.items():
-                    image = self.renderer.render_reminder(rows, datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))))
-                    links = "\n".join(f"官方抽票地址：{url}" for url in dict.fromkeys(row["url"] for row in rows))
-                    try:
-                        message = MessageChain().message("抽选截止提醒\n" + links).file_image(str(image))
-                        ok = bool(await self.context.send_message(umo, message))
-                    except Exception:
-                        ok = False
-                        logger.exception("IM@S deadline image delivery failed")
-                    await self.service.finish_reminders(rows, ok)
+                    for offset in range(0, len(rows), 3):
+                        batch = rows[offset:offset+3]
+                        try:
+                            image = await asyncio.to_thread(self.renderer.render_reminder, batch, datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))))
+                            links = "\n".join(f"官方抽票地址：{url}" for url in dict.fromkeys(row["url"] for row in batch))
+                            message = MessageChain().message("抽票截止提醒\n" + links).file_image(str(image))
+                            ok = bool(await self.context.send_message(umo, message))
+                        except Exception:
+                            ok = False
+                            logger.exception("IM@S deadline image delivery failed")
+                        await self.service.finish_reminders(batch, ok)
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 raise
@@ -84,31 +88,18 @@ class ImasLivePlugin(Star):
                 await asyncio.sleep(30)
 
     @filter.command("imaslive")
-    async def imaslive(self, event: AstrMessageEvent, action: str = ""):
+    async def imaslive(self, event: AstrMessageEvent):
         """显示今天起 30 个自然日的 PNG 列表日历。"""
         event.stop_event()
-        command = action.strip().lower()
-        if command in {"enable", "disable"}:
-            group_id = str(event.get_group_id() or "").strip()
-            umo = str(event.unified_msg_origin or "").strip()
-            if not group_id or not umo:
-                yield event.plain_result("请在群聊中使用 /imaslive enable 或 /imaslive disable。")
-                return
-            self.service.set_group_enabled(umo, command == "enable")
-            state = "已开启" if command == "enable" else "已关闭"
-            yield event.plain_result(f"本群 IMAS LIVE 已{state}。")
-            return
-        if command:
-            yield event.plain_result("用法：/imaslive、/imaslive enable、/imaslive disable")
-            return
-        umo = str(event.unified_msg_origin or "").strip()
-        if event.get_group_id() and not self.service.group_enabled(umo):
-            yield event.plain_result("本群 IMAS LIVE 当前已关闭；请使用 /imaslive enable 开启。")
-            return
         try:
+            await self.initialize()
+            if not self.service.db.meta('last_directory_sync') and self.config.get('enabled', True):
+                yield event.plain_result('正在首次同步官网活动，稍候生成日历。')
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.service.directory_ready.wait(), timeout=40)
             entries, start, end, status = await self.service.calendar_entries()
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
-            images = self.renderer.render_calendar(entries, start.date(), end.date(), now, status)
+            images = await asyncio.to_thread(self.renderer.render_calendar, entries, start.date(), end.date(), now, status)
             for image in images:
                 yield event.image_result(str(image))
         except Exception:

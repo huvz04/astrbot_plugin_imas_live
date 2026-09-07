@@ -87,7 +87,7 @@ def _links(node: Tag, base_url: str) -> list[str]:
 
 
 def _nearest_title(node: Tag) -> str:
-    accordion = node.find_parent("dl", class_="accordionList")
+    accordion = node.find_parent('dl', class_=lambda value: value in {'accordionList', 'accordion'})
     if accordion:
         heading = accordion.find("dt", recursive=False)
         if heading:
@@ -97,6 +97,10 @@ def _nearest_title(node: Tag) -> str:
         heading = details.find("summary")
         if heading:
             return clean(heading.get_text(" "))
+    if node.find_parent('div', class_='ticketCol'):
+        heading = node.find_previous('h2')
+        if heading:
+            return clean(heading.get_text(' '))
     ancestor = node
     while ancestor:
         if ancestor.name in {"section", "details", "dl"}:
@@ -191,7 +195,7 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
     seen: set[str] = set()
     # These are the field-owning units in the three documented page designs.
     # Do not traverse broad page sections: repeated dt labels would overwrite one another.
-    containers = soup.select("section.p-ticket__group, dl.ticketList, dl.c-dl")
+    containers = soup.select("section.p-ticket__group, dl.ticketList, dl.c-dl, .ticketCol > dl")
     # Small Gakuen sections and SideM accordions carry fields in one container.
     for node in containers:
         pairs = _pairs(node)
@@ -200,7 +204,7 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         links = _links(node, source_url)
         if not period and not ticket_url and not links:
             continue
-        title = re.sub(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s*Update|受付終了|終了しました', '', _nearest_title(node)).strip()
+        title = re.sub(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s*Update!?|受付(?:は)?終了しました|受付終了|終了しました', '', _nearest_title(node), flags=re.I).strip()
         whole = clean(node.get_text(" "))
         if "中止" in title or "取消" in title:
             parsed.review_notes.append(f"已发现取消/中止标题，未生成提醒：{title}")
@@ -270,14 +274,23 @@ def schedule_performances(text: str, source_url: str, venue: str | None = None,
 
 def parse_information(html: str, source_url: str) -> list[Performance]:
     soup = BeautifulSoup(html, 'html.parser')
-    labels = {'公演日時', '開催日時', '日程', '公演日程', '日時'}
+    labels = {'公演日時', '開催日時', '日程', '公演日程', '日時', '開催日'}
     for node in soup.find_all(['dt', 'h2', 'h3', 'h4']):
         label = re.sub(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s*Update', '', clean(node.get_text(' '))).strip()
         if label not in labels:
             continue
-        block = node.find_next_sibling('dd') if node.name == 'dt' else node.find_next_sibling()
-        if block:
-            rows = schedule_performances(block.get_text('\n', strip=True), source_url, parse_venue(html))
+        blocks = []
+        if node.name == 'dt':
+            block = node.find_next_sibling('dd')
+            if block:
+                blocks.append(block)
+        else:
+            for block in node.find_next_siblings():
+                if block.name == 'dt' or (block.name in {'h1', 'h2', 'h3', 'h4'} and int(block.name[1]) <= int(node.name[1])):
+                    break
+                blocks.append(block)
+        if blocks:
+            rows = schedule_performances('\n'.join(block.get_text('\n', strip=True) for block in blocks), source_url, parse_venue(html))
             if rows:
                 return rows
     return []
