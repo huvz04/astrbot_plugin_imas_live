@@ -4,7 +4,7 @@ short_desc: 月份 LIVE 图片日历、近期现场抽选与截止提醒
 desc: |
   从偶像大师官网公开目录和专题页同步活动、场次与票务轮次，提供月份 LIVE 与近期抽选 PNG 图片。
   只在 WebUI 白名单群发送一次现场抽选截止提醒；不登录票务站、不查询个人中签或库存。
-version: 0.2.0
+version: 0.2.1
 author: huvz04
 repo: "https://github.com/huvz04/astrbot_plugin_imas_live"
 astrbot_version: ">=4.18.0"

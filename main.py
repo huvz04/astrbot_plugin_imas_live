@@ -20,6 +20,7 @@ from .imas_live.render import CalendarRenderer
 from .imas_live.service import ImasLiveService
 
 PLUGIN_NAME = "astrbot_plugin_imas_live"
+REMINDER_CHECK_SECONDS = 5 * 60
 
 
 def parse_live_month(argument: str) -> int | None:
@@ -75,7 +76,7 @@ class ImasLivePlugin(Star):
                 await asyncio.sleep(60)
 
     async def _reminder_loop(self) -> None:
-        """Independent 30s deadline check: it never waits for the slower HTTP sync loop."""
+        """Check cached deadlines every five minutes, independently of website syncs."""
         while True:
             try:
                 due = await self.service.claim_due_reminders()
@@ -94,12 +95,12 @@ class ImasLivePlugin(Star):
                             ok = False
                             logger.exception("IM@S deadline image delivery failed")
                         await self.service.finish_reminders(batch, ok)
-                await asyncio.sleep(30)
+                await asyncio.sleep(REMINDER_CHECK_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("IM@S deadline cycle failed")
-                await asyncio.sleep(30)
+                await asyncio.sleep(REMINDER_CHECK_SECONDS)
 
     async def _wait_for_first_directory(self, event: AstrMessageEvent) -> None:
         await self.initialize()

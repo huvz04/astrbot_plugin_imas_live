@@ -133,6 +133,18 @@ class CalendarTests(unittest.TestCase):
             self.assertEqual(len(due), 1)
             asyncio.run(service.close())
 
+    def test_cached_deadline_enters_window_without_another_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {"display_timezone": "Asia/Shanghai", "white_umos": ["aiocqhttp:GroupMessage:42"], "freshness_hours": 24}
+            service = ImasLiveService(Path(tmp), cfg)
+            # The cached page arrives 70 minutes before the Beijing deadline.
+            seed(service)
+            before_window = datetime(2026, 9, 7, 22, 49, tzinfo=ZoneInfo("Asia/Shanghai"))
+            at_window = datetime(2026, 9, 7, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+            self.assertEqual(asyncio.run(service.claim_due_reminders(before_window)), [])
+            self.assertEqual(len(asyncio.run(service.claim_due_reminders(at_window))), 1)
+            asyncio.run(service.close())
+
     def test_renderer_exports_readable_empty_long_and_reminder_pngs(self):
         with tempfile.TemporaryDirectory() as tmp:
             renderer = CalendarRenderer(Path(tmp))
