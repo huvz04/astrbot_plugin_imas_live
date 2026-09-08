@@ -102,7 +102,9 @@ class CalendarRenderer:
         color, label, _ = self._brand_style(entry["brands"])
         width = self.width - 180
         labels = self._wrap(draw, label, self.font(20, True), width - 270)
-        title = self._wrap(draw, entry["title"], self.font(28, True), width)
+        number = entry.get("public_number")
+        numbered_title = f"#{number} · {entry['title']}" if number else entry["title"]
+        title = self._wrap(draw, numbered_title, self.font(28, True), width)
         deadline = entry.get("kind") == "deadline" or reminder
         ticket = entry.get("kind") == "ticket"
         ticket_status = entry.get("ticket_status", "")
@@ -205,8 +207,8 @@ class CalendarRenderer:
         image = Image.new('RGB', (self.width, height), '#f5f7fb')
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, header_height), fill='#172033')
-        draw.text((48, 28), '近期现场抽选', font=self.font(42, True), fill='white')
-        draw.text((48, 90), '当前开放 + 未来30天将开放', font=self.font(26), fill='#c8d3e6')
+        draw.text((48, 28), 'Current Lotteries', font=self.font(42, True), fill='white')
+        draw.text((48, 90), '正在开放的已核验现场抽选', font=self.font(26), fill='#c8d3e6')
         zone = '北京时间' if str(generated_at.tzinfo) == 'Asia/Shanghai' else str(generated_at.tzinfo)
         draw.text((48, 136), f'{zone} {start:%Y.%m.%d} — {(end - timedelta(days=1)):%Y.%m.%d}', font=self.font(22), fill='#c8d3e6')
         y = header_height + 28

@@ -61,4 +61,6 @@ class ParsedPage:
     ticket_rounds: list[TicketRound] = field(default_factory=list)
     performances: list[Performance] = field(default_factory=list)
     cast: list[CastAppearance] = field(default_factory=list)
+    # Only actual roster images found inside an official CAST/出演者 section.
+    cast_asset_urls: list[str] = field(default_factory=list)
     review_notes: list[str] = field(default_factory=list)

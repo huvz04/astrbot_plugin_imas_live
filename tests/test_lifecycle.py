@@ -53,7 +53,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             plugin.config = {}
             plugin.service = ImasLiveService(Path(directory))
             plugin.renderer = Mock()
-            plugin.renderer.render_calendar.return_value = [Path(directory) / 'calendar.png']
+            rendered = Path(directory) / 'calendar.png'; rendered.touch()
+            plugin.renderer.render_calendar.return_value = [rendered]
             plugin._sync_task = plugin._reminder_task = None
             async def sync():
                 await asyncio.sleep(0)
@@ -66,8 +67,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             event = Mock()
             event.plain_result.side_effect = lambda text: ('text', text)
             event.image_result.side_effect = lambda path: ('image', path)
+            event.chain_result.side_effect = lambda chain: ('chain', chain)
             responses = [result async for result in plugin.imaslive(event)]
-            self.assertEqual([result[0] for result in responses], ['text', 'image'])
+            self.assertEqual([result[0] for result in responses], ['text', 'chain'])
             self.assertTrue(plugin.service.directory_ready.is_set())
             running = (plugin._sync_task, plugin._reminder_task)
             await plugin.initialize()

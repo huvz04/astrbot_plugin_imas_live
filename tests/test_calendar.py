@@ -66,19 +66,19 @@ class CalendarTests(unittest.TestCase):
             enabled_umo = "aiocqhttp:GroupMessage:43"
             cfg = {"display_timezone": "Asia/Shanghai", "white_umos": [disabled_umo, enabled_umo], "freshness_hours": 24}
             service = ImasLiveService(Path(tmp), cfg)
-            self.assertTrue(service.group_enabled(disabled_umo))
-            service.set_group_enabled(disabled_umo, False)
-            self.assertFalse(service.group_enabled(disabled_umo))
-            self.assertTrue(service.group_enabled(enabled_umo))
+            self.assertTrue(service.subscription_enabled("ticket", disabled_umo))
+            service.set_subscription("ticket", disabled_umo, False)
+            self.assertFalse(service.subscription_enabled("ticket", disabled_umo))
+            self.assertTrue(service.subscription_enabled("ticket", enabled_umo))
             seed(service)
             frozen = datetime(2026, 9, 7, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
             due = asyncio.run(service.claim_due_reminders(frozen))
             self.assertEqual([row["umo"] for row in due], [enabled_umo])
             asyncio.run(service.close())
             restarted = ImasLiveService(Path(tmp), cfg)
-            self.assertFalse(restarted.group_enabled(disabled_umo))
-            restarted.set_group_enabled(disabled_umo, True)
-            self.assertTrue(restarted.group_enabled(disabled_umo))
+            self.assertFalse(restarted.subscription_enabled("ticket", disabled_umo))
+            restarted.set_subscription("ticket", disabled_umo, True)
+            self.assertTrue(restarted.subscription_enabled("ticket", disabled_umo))
             asyncio.run(restarted.close())
 
     def test_calendar_includes_only_performances(self):
@@ -88,7 +88,7 @@ class CalendarTests(unittest.TestCase):
             entries, start, end, _, title = asyncio.run(service.calendar_entries(datetime(2026, 9, 7, 10, tzinfo=ZoneInfo("Asia/Shanghai"))))
             self.assertEqual((end.date() - start.date()).days, 30)
             self.assertEqual({item["kind"] for item in entries}, {"performance"})
-            self.assertEqual(title, "未来30天 LIVE")
+            self.assertEqual(title, "IM@S LIVE! · Next 30 Days")
             self.assertTrue(any("福冈会场" in item["subtitle"] for item in entries if item["kind"] == "performance"))
             asyncio.run(service.close())
 
@@ -109,7 +109,7 @@ class CalendarTests(unittest.TestCase):
             asyncio.run(restarted.close())
             service = ImasLiveService(Path(tmp), cfg)
             service.db.save_parsed("cms-calendar", "https://example.test/ticket", "changed", "test", [TicketRound("round-calendar", "一般会員2次先行", "onsite", "lottery", "2026-09-07T12:00+09:00", "2026-09-08T01:59+09:00", evidence=Evidence("https://example.test/ticket", "延期", "test"))], [], [], [])
-            changed = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 8, 0, 29, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            changed = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 7, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))))
             self.assertEqual(len(changed), 1)
             asyncio.run(service.close())
 
@@ -121,16 +121,16 @@ class CalendarTests(unittest.TestCase):
             due = asyncio.run(service.claim_due_reminders(frozen)); asyncio.run(service.finish_reminders(due, False))
             self.assertEqual(len(asyncio.run(service.claim_due_reminders(frozen))), 1)
             self.assertEqual(asyncio.run(service.claim_due_reminders(datetime(2026, 9, 7, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai")))), [])
-            service.config["white_umos"] = []
+            service.set_subscription("ticket", "aiocqhttp:GroupMessage:42", False)
             self.assertEqual(asyncio.run(service.claim_due_reminders(frozen)), [])
             asyncio.run(service.close())
 
-    def test_thirty_minute_configuration_enters_its_own_window(self):
+    def test_old_single_minute_configuration_does_not_override_dual_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {"display_timezone": "Asia/Shanghai", "white_umos": ["aiocqhttp:GroupMessage:42"], "reminder_before_minutes": 30, "freshness_hours": 24}
             service = ImasLiveService(Path(tmp), cfg); seed(service)
             due = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 7, 23, 29, tzinfo=ZoneInfo("Asia/Shanghai"))))
-            self.assertEqual(len(due), 1)
+            self.assertEqual(due, [])
             asyncio.run(service.close())
 
     def test_cached_deadline_enters_window_without_another_sync(self):
@@ -143,6 +143,48 @@ class CalendarTests(unittest.TestCase):
             at_window = datetime(2026, 9, 7, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
             self.assertEqual(asyncio.run(service.claim_due_reminders(before_window)), [])
             self.assertEqual(len(asyncio.run(service.claim_due_reminders(at_window))), 1)
+            asyncio.run(service.close())
+
+    def test_event_numbers_survive_filters_and_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ImasLiveService(Path(tmp), {"freshness_hours": 48})
+            seed(service)
+            number = service.db.detail("cms-calendar")["event"]["public_number"]
+            self.assertEqual(service.db.detail_by_public_number(number)["event"]["id"], "cms-calendar")
+            service.config["brands"] = ["SIDEM"]
+            self.assertEqual(asyncio.run(service.calendar_entries())[0], [])
+            asyncio.run(service.close())
+            restarted = ImasLiveService(Path(tmp))
+            self.assertEqual(restarted.db.detail("cms-calendar")["event"]["public_number"], number)
+            asyncio.run(restarted.close())
+
+    def test_ticket_24h_and_1h_nodes_are_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            umo = "aiocqhttp:GroupMessage:42"
+            cfg = {"display_timezone": "Asia/Shanghai", "freshness_hours": 48, "white_umos": [umo]}
+            service = ImasLiveService(Path(tmp), cfg)
+            seed(service, "2026-09-09T00:59+09:00")
+            service.db.set_meta("last_successful_sync", "2026-09-08T15:00:00+00:00")
+            first = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 7, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            self.assertEqual(len(first), 1); self.assertIn("提前24小时", first[0]["subtitle"])
+            asyncio.run(service.finish_reminders(first, True))
+            second = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 8, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            self.assertEqual(len(second), 1); self.assertIn("提前1小时", second[0]["subtitle"])
+            asyncio.run(service.close())
+
+    def test_live_jst_reminder_is_one_hour_before_beijing_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ImasLiveService(Path(tmp), {"display_timezone": "Asia/Shanghai", "freshness_hours": 48})
+            source = "https://example.test/live"
+            service.db.upsert_event({"id": "live-time", "title": "时间测试", "brands": ["SIDEM"], "url": source, "event_display": None, "venue": "会场", "updated": None})
+            service.db.save_parsed("live-time", source, "v1", "test", [], [Performance("day", "2026-09-08", "DAY1 开演 17:30 JST", "会场", evidence=Evidence(source, "official", "test"))], [], [])
+            with service.db._connect() as db: db.execute("UPDATE sources SET fetched_at='2026-09-08T00:00:00+00:00' WHERE event_id='live-time'")
+            service.set_subscription("live", "aiocqhttp:GroupMessage:42", True)
+            with service.db._connect() as db:
+                db.execute("UPDATE live_group_subscriptions SET created_at='1970-01-01T00:00:00+00:00'")
+            due = asyncio.run(service.claim_due_live_reminders(datetime(2026, 9, 8, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            self.assertEqual(len(due), 1)
+            self.assertIn("16:30", due[0]["subtitle"])
             asyncio.run(service.close())
 
     def test_renderer_exports_readable_empty_long_and_reminder_pngs(self):

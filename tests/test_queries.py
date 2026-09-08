@@ -29,9 +29,9 @@ class QueryTests(unittest.TestCase):
     def test_month_window_rules_and_leap_year(self):
         current = datetime(2026, 9, 8, 13, tzinfo=ZONE)
         for month, start, end, title in (
-            (10, "2026-10-01", "2026-11-01", "2026年10月 LIVE"),
-            (1, "2027-01-01", "2027-02-01", "2027年1月 LIVE"),
-            (9, "2026-09-01", "2026-10-01", "2026年9月 LIVE"),
+            (10, "2026-10-01", "2026-11-01", "IM@S LIVE! · October 2026"),
+            (1, "2027-01-01", "2027-02-01", "IM@S LIVE! · January 2027"),
+            (9, "2026-09-01", "2026-10-01", "IM@S LIVE! · September 2026"),
         ):
             actual_start, actual_end, actual_title = ImasLiveService._month_window(current, month)
             self.assertEqual(str(actual_start.date()), start)
@@ -62,7 +62,7 @@ class QueryTests(unittest.TestCase):
             self.assertEqual([row["display_date"] for row in rows], ["2026-09-08", "2026-10-07"])
             month_rows, month_start, month_end, _, title = asyncio.run(service.calendar_entries(CURRENT, 9))
             self.assertEqual([row["display_date"] for row in month_rows], ["2026-09-01", "2026-09-08"])
-            self.assertEqual((str(month_start.date()), str(month_end.date()), title), ("2026-09-01", "2026-10-01", "2026年9月 LIVE"))
+            self.assertEqual((str(month_start.date()), str(month_end.date()), title), ("2026-09-01", "2026-10-01", "IM@S LIVE! · September 2026"))
             asyncio.run(service.close())
 
     def test_ticket_action_window_statuses_and_source_freshness(self):
@@ -85,10 +85,10 @@ class QueryTests(unittest.TestCase):
             by_round = {entry["subtitle"].splitlines()[0]: entry for entry in entries}
             self.assertEqual(by_round["轮次：恰好24小时"]["ticket_status"], "urgent")
             self.assertEqual(by_round["轮次：开放超过窗口"]["ticket_status"], "open")
-            self.assertEqual(by_round["轮次：窗口内即将开始"]["ticket_status"], "upcoming")
-            self.assertEqual(by_round["轮次：尚未开始不能标开放"]["ticket_status"], "upcoming")
-            self.assertEqual(by_round["轮次：开始待核验"]["ticket_status"], "unknown")
-            self.assertEqual(by_round["轮次：陈旧缓存"]["ticket_status"], "stale")
+            self.assertNotIn("轮次：窗口内即将开始", by_round)
+            self.assertNotIn("轮次：尚未开始不能标开放", by_round)
+            self.assertNotIn("轮次：开始待核验", by_round)
+            self.assertNotIn("轮次：陈旧缓存", by_round)
             self.assertNotIn("轮次：窗口外才开始", by_round)
             self.assertNotIn("轮次：已经截止", by_round)
             self.assertIn("北京时间", by_round["轮次：恰好24小时"]["subtitle"])

@@ -1,7 +1,7 @@
 from pathlib import Path
 import unittest
 
-from imas_live.parsing import parse_shiny_information, parse_ticket_page, parse_venue
+from imas_live.parsing import official_roster_image_urls, parse_shiny_information, parse_ticket_page, parse_venue
 
 
 SOURCES = Path(__file__).parent / "fixtures"
@@ -12,6 +12,17 @@ def fixture(name: str) -> str:
 
 
 class ParsingTests(unittest.TestCase):
+    def test_million_roster_images_exclude_day_title_banners(self):
+        html = '''<section><h2><span>出演者</span></h2><ul>
+          <li><img src="../images/information/bnr_day1.webp"></li>
+          <li><img src="../images/information/bnr_day2.webp"></li>
+          <li><img src="../images/information/bnr_day1_title01.webp"></li>
+        </ul></section>'''
+        urls = official_roster_image_urls(html, "https://idolmaster-official.jp/live_event/million14th/information/")
+        self.assertEqual(urls, [
+            "https://idolmaster-official.jp/live_event/million14th/images/information/bnr_day1.webp",
+            "https://idolmaster-official.jp/live_event/million14th/images/information/bnr_day2.webp",
+        ])
     def test_venue_uses_only_an_explicit_official_field(self):
         html = "<dl><dt>開催場所</dt><dd>国立代々木競技場 第一体育館</dd></dl>"
         self.assertEqual(parse_venue(html), "国立代々木競技場 第一体育館")

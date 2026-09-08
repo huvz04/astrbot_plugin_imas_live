@@ -337,3 +337,63 @@ def parse_shiny_information(html: str, source_url: str) -> ParsedPage:
     if not parsed.performances:
         parsed.review_notes.append("闪彩页面未定位到带年份的日程与 CAST 区块；未猜测演出年份。")
     return parsed
+
+
+def parse_day_cast(html: str, source_url: str) -> ParsedPage:
+    """Read explicitly labelled DAY cast text without inferring CV appearances.
+
+    This deliberately accepts only text in a DAY/CAST section.  Decorative title
+    images and character-profile images are not a cast roster.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    parsed = ParsedPage()
+    year_match = YEAR.search(clean(soup.get_text(" ")))
+    year = int(year_match.group(1)) if year_match else None
+    for heading in soup.find_all(["h2", "h3", "h4"]):
+        heading_text = clean(heading.get_text(" "))
+        if "DAY" not in heading_text.upper() or "CAST" not in heading_text.upper():
+            continue
+        day = date_only(heading_text, year)
+        if not day:
+            continue
+        key = stable(source_url, day, heading_text)
+        parsed.performances.append(Performance(key, day, heading_text, None,
+            evidence=Evidence(source_url, heading_text, "day-cast-html")))
+        chunks: list[str] = []
+        for sibling in heading.find_next_siblings():
+            if sibling.name in {"h2", "h3", "h4"}:
+                break
+            chunks.extend(clean(line) for line in sibling.get_text("\n").splitlines() if clean(line))
+        for line in dict.fromkeys(chunks):
+            # Official pages commonly write 団体名 / 声优名（角色名）.  Preserve
+            # the entire left part as the published performer/group label.
+            match = re.match(r"(.{2,80}?)\s*[（(]([^()（）]{1,80})[)）]$", line)
+            if not match or "http" in line:
+                continue
+            name, role = clean(match.group(1)), clean(match.group(2))
+            if name and role:
+                parsed.cast.append(CastAppearance(name, role, key,
+                    evidence=Evidence(source_url, line, "day-cast-html")))
+    if not parsed.cast:
+        parsed.review_notes.append("未找到分日官方文字出演名单；未把装饰图或角色资料当作出演。")
+    return parsed
+
+
+def official_roster_image_urls(html: str, source_url: str) -> list[str]:
+    """Return only complete, semantically-labelled official roster artwork.
+
+    The known Million 14th page places exactly bnr_day1.webp/bnr_day2.webp
+    below its 出演者 heading.  Title banners such as bnr_day1_title01.webp are
+    intentionally excluded, rather than guessed to be a cast image.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    heading = next((node for node in soup.find_all(["h2", "h3"]) if "出演者" in clean(node.get_text(" "))), None)
+    if not heading:
+        return []
+    container = heading.parent
+    values = []
+    for image in container.select("img[src]") if container else []:
+        src = image.get("src", "")
+        if re.search(r"/bnr_day\d+\.webp(?:[?#].*)?$", src):
+            values.append(urljoin(source_url, src))
+    return list(dict.fromkeys(values))

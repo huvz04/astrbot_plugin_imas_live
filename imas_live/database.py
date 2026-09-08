@@ -84,6 +84,25 @@ class Database:
               dedupe_key TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, state TEXT NOT NULL,
               payload TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            -- This mapping is separate from CMS IDs so a number does not change
+            -- when an event is refreshed, filtered, or eventually removed.
+            CREATE TABLE IF NOT EXISTS event_numbers (
+              event_id TEXT PRIMARY KEY, public_number INTEGER NOT NULL UNIQUE,
+              FOREIGN KEY(event_id) REFERENCES events(id)
+            );
+            CREATE TABLE IF NOT EXISTS live_group_subscriptions (
+              umo TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ticket_group_subscriptions (
+              umo TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cast_assets (
+              event_id TEXT NOT NULL, image_url TEXT NOT NULL, cached_path TEXT NOT NULL,
+              source_url TEXT NOT NULL, fetched_at TEXT NOT NULL,
+              PRIMARY KEY(event_id,image_url), FOREIGN KEY(event_id) REFERENCES events(id)
+            );
             """)
             # Early local builds keyed sources only by URL; tours share URLs.
             if not any(row['name'] == 'event_id' and row['pk'] for row in db.execute('PRAGMA table_info(sources)')):
@@ -97,6 +116,16 @@ class Database:
             if not any(row['name'] == 'attempted_at' for row in db.execute('PRAGMA table_info(sources)')):
                 db.execute("ALTER TABLE sources ADD COLUMN attempted_at TEXT")
                 db.execute("UPDATE sources SET attempted_at=fetched_at")
+            # Upgrade existing installations before their next directory sync.
+            # First assignment prefers the nearest dated performance, then
+            # stable creation/ID ordering; it is never used as a live ranking.
+            missing = db.execute("""SELECT e.id FROM events e LEFT JOIN event_numbers n ON n.event_id=e.id
+                LEFT JOIN performances p ON p.event_id=e.id
+                WHERE n.event_id IS NULL GROUP BY e.id
+                ORDER BY MIN(CASE WHEN p.date>=date('now') THEN p.date END) IS NULL,
+                    MIN(CASE WHEN p.date>=date('now') THEN p.date END),e.created_at,e.id""").fetchall()
+            for row in missing:
+                db.execute("INSERT INTO event_numbers(event_id,public_number) VALUES(?, COALESCE((SELECT MAX(public_number)+1 FROM event_numbers),1))", (row["id"],))
 
     def upsert_event(self, item: dict[str, Any]) -> None:
         stamp = now()
@@ -110,6 +139,9 @@ class Database:
                 "url": item.get("url"), "display": item.get("event_display"), "venue": item.get("venue"),
                 "updated": item.get("updated"), "stamp": stamp,
             })
+            # SQLite serializes writers, making MAX()+1 safe in this transaction.
+            db.execute("""INSERT OR IGNORE INTO event_numbers(event_id,public_number)
+                VALUES(?, COALESCE((SELECT MAX(public_number) + 1 FROM event_numbers), 1))""", (item["id"],))
 
     def save_parsed(self, event_id: str, source_url: str, content_hash: str, parser: str,
                     tickets: Iterable[TicketRound], performances: Iterable[Performance],
@@ -163,6 +195,19 @@ class Database:
               (url, event_id, now(), error[:500]))
             db.execute('UPDATE sources SET attempted_at=? WHERE event_id=? AND url=?', (now(), event_id, url))
 
+    def save_cast_assets(self, event_id: str, source_url: str, assets: Iterable[tuple[str, str]]) -> None:
+        with self._connect() as db:
+            for image_url, cached_path in assets:
+                db.execute("""INSERT INTO cast_assets VALUES(?,?,?,?,?)
+                    ON CONFLICT(event_id,image_url) DO UPDATE SET cached_path=excluded.cached_path,
+                    source_url=excluded.source_url,fetched_at=excluded.fetched_at""",
+                    (event_id, image_url, cached_path, source_url, now()))
+
+    def cast_assets(self, event_id: str) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute("SELECT cached_path FROM cast_assets WHERE event_id=? ORDER BY image_url", (event_id,)).fetchall()
+        return [row["cached_path"] for row in rows]
+
     def list_events(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute("""SELECT e.*, COUNT(DISTINCT p.id) performance_count FROM events e
@@ -204,13 +249,20 @@ class Database:
 
     def detail(self, query: str) -> dict[str, Any] | None:
         with self._connect() as db:
-            event = db.execute("SELECT * FROM events WHERE id=? OR title LIKE ? ORDER BY id=? DESC LIMIT 1", (query, f"%{query}%", query)).fetchone()
+            event = db.execute("""SELECT e.*,n.public_number FROM events e
+                LEFT JOIN event_numbers n ON n.event_id=e.id
+                WHERE e.id=? OR e.title LIKE ? ORDER BY e.id=? DESC LIMIT 1""", (query, f"%{query}%", query)).fetchone()
             if not event:
                 return None
             event_id = event["id"]
             return {"event": dict(event), "performances": [dict(x) for x in db.execute("SELECT * FROM performances WHERE event_id=?", (event_id,))],
                     "tickets": [dict(x) for x in db.execute("SELECT * FROM ticket_rounds WHERE event_id=?", (event_id,))],
                     "cast": [dict(x) for x in db.execute("SELECT * FROM cast_appearances WHERE event_id=?", (event_id,))]}
+
+    def detail_by_public_number(self, number: int) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT event_id FROM event_numbers WHERE public_number=?", (number,)).fetchone()
+        return self.detail(row["event_id"]) if row else None
 
     def stats(self, year: str = "", brand: str = "") -> dict[str, Any]:
         clauses, values = ["1=1"], []
@@ -249,6 +301,51 @@ class Database:
                 ON CONFLICT(umo) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at""",
                        (umo, int(enabled), now()))
 
+    def migrate_legacy_ticket_subscriptions(self, umos: Iterable[str]) -> None:
+        """Import old whitelist once, without granting it the new LIVE channel."""
+        with self._connect() as db:
+            if db.execute("SELECT 1 FROM meta WHERE key='ticket_subscriptions_v1_migrated'").fetchone():
+                return
+            stamp = now()
+            # A legacy whitelist predates this table, so it is not a "late
+            # enable" for the purpose of the current alert window.
+            legacy_created = "1970-01-01T00:00:00+00:00"
+            for umo in dict.fromkeys(str(x) for x in umos if str(x)):
+                old = db.execute("SELECT enabled FROM group_switches WHERE umo=?", (umo,)).fetchone()
+                enabled = int(old["enabled"]) if old else 1
+                db.execute("""INSERT OR IGNORE INTO ticket_group_subscriptions VALUES(?,?,?,?)""",
+                           (umo, enabled, legacy_created, stamp))
+            db.execute("INSERT INTO meta VALUES('ticket_subscriptions_v1_migrated','1')")
+
+    def set_subscription(self, kind: str, umo: str, enabled: bool) -> None:
+        table = self._subscription_table(kind)
+        with self._connect() as db:
+            stamp = now()
+            db.execute(f"""INSERT INTO {table}(umo,enabled,created_at,updated_at) VALUES(?,?,?,?)
+                ON CONFLICT(umo) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at""",
+                       (umo, int(enabled), stamp, stamp))
+
+    def subscription_enabled(self, kind: str, umo: str) -> bool:
+        table = self._subscription_table(kind)
+        with self._connect() as db:
+            row = db.execute(f"SELECT enabled FROM {table} WHERE umo=?", (umo,)).fetchone()
+        return bool(row and row["enabled"])
+
+    def subscription_created_at(self, kind: str, umo: str) -> datetime | None:
+        table = self._subscription_table(kind)
+        with self._connect() as db:
+            row = db.execute(f"SELECT created_at FROM {table} WHERE umo=?", (umo,)).fetchone()
+        try:
+            return datetime.fromisoformat(row["created_at"]) if row else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _subscription_table(kind: str) -> str:
+        if kind not in {"live", "ticket"}:
+            raise ValueError("unknown subscription kind")
+        return f"{kind}_group_subscriptions"
+
     def group_enabled(self, umo: str, default: bool = True) -> bool:
         with self._connect() as db:
             row = db.execute("SELECT enabled FROM group_switches WHERE umo=?", (umo,)).fetchone()
@@ -272,11 +369,15 @@ class Database:
     def calendar_rows(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Return only concrete performance dates and verified lottery deadlines."""
         with self._connect() as db:
-            performances = [dict(row) for row in db.execute("""SELECT p.*,e.title,e.brands_json,e.event_display,e.venue AS event_venue
-                FROM performances p JOIN events e ON e.id=p.event_id WHERE p.date IS NOT NULL AND p.status!='cancelled'""")]
-            deadlines = [dict(row) for row in db.execute("""SELECT t.*,e.title,e.brands_json,e.event_display,e.venue,
+            performances = [dict(row) for row in db.execute("""SELECT p.*,e.title,e.brands_json,e.event_display,e.venue AS event_venue,
+                n.public_number,s.fetched_at AS source_fetched_at,s.quality AS source_quality FROM performances p JOIN events e ON e.id=p.event_id
+                LEFT JOIN event_numbers n ON n.event_id=e.id
+                LEFT JOIN sources s ON s.event_id=p.event_id AND s.url=p.source_url
+                WHERE p.date IS NOT NULL AND p.status!='cancelled'""")]
+            deadlines = [dict(row) for row in db.execute("""SELECT t.*,e.title,e.brands_json,e.event_display,e.venue,n.public_number,
                     s.fetched_at AS source_fetched_at,s.quality AS source_quality
                 FROM ticket_rounds t JOIN events e ON e.id=t.event_id
+                LEFT JOIN event_numbers n ON n.event_id=e.id
                 LEFT JOIN sources s ON s.event_id=e.id AND s.url=CASE WHEN EXISTS(
                     SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
                     THEN e.official_url ELSE t.source_url END
@@ -287,12 +388,13 @@ class Database:
     def ticket_query_rows(self) -> list[dict[str, Any]]:
         """Return every verified onsite lottery round with source freshness evidence."""
         with self._connect() as db:
-            rows = db.execute("""SELECT t.*,e.title,e.brands_json,e.venue AS event_venue,
+            rows = db.execute("""SELECT t.*,e.title,e.brands_json,e.venue AS event_venue,n.public_number,
                     s.fetched_at AS source_fetched_at,s.quality AS source_quality,
                     MIN(p.date) AS performance_date,
                     COALESCE(MIN(NULLIF(p.venue,'')), e.venue) AS performance_venue
                 FROM ticket_rounds t
                 JOIN events e ON e.id=t.event_id
+                LEFT JOIN event_numbers n ON n.event_id=e.id
                 LEFT JOIN performances p ON p.event_id=e.id AND p.date IS NOT NULL AND p.status!='cancelled'
                 LEFT JOIN sources s ON s.event_id=e.id AND s.url=CASE WHEN EXISTS(
                     SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
