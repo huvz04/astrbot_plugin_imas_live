@@ -213,7 +213,12 @@ class CalendarRenderer:
         draw.text((48, 136), f'{zone} {start:%Y.%m.%d} — {(end - timedelta(days=1)):%Y.%m.%d}', font=self.font(22), fill='#c8d3e6')
         y = header_height + 28
         if not cards:
-            message = '数据尚未同步完成，请稍后再发送 /imasticket。' if '尚未同步' in status else '近期暂无已核验的现场抽选。'
+            if '尚未同步' in status:
+                message = '数据尚未同步完成，请稍后再发送 /imasticket。'
+            elif '当前开放轮次的专题缓存待复核' in status or '复核失败' in status:
+                message = '暂未能核验当前开放轮次；请查看底部复核状态。'
+            else:
+                message = '近期暂无已核验的现场抽选。'
             draw.text((48, y + 48), message, font=self.font(30, True), fill='#25324a')
         for card in cards:
             self._draw_card(draw, card, y)

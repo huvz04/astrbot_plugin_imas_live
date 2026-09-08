@@ -231,6 +231,15 @@ class Database:
                     COALESCE(s.attempted_at,''), e.source_updated DESC LIMIT ?""", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def events_by_ids(self, event_ids: Iterable[str]) -> list[dict[str, Any]]:
+        values = list(dict.fromkeys(str(item) for item in event_ids if item))
+        if not values:
+            return []
+        placeholders = ",".join("?" for _ in values)
+        with self._connect() as db:
+            rows = db.execute(f"SELECT * FROM events WHERE id IN ({placeholders})", values).fetchall()
+        return [dict(row) for row in rows]
+
     def save_directory_dates(self, event_id: str, rows: list[Performance]) -> None:
         with self._connect() as db:
             db.execute("DELETE FROM performances WHERE event_id=? AND status='directory'", (event_id,))
@@ -377,7 +386,9 @@ class Database:
             performances = [dict(row) for row in db.execute("""SELECT p.*,e.title,e.brands_json,e.event_display,e.venue AS event_venue,
                 n.public_number,s.fetched_at AS source_fetched_at,s.quality AS source_quality FROM performances p JOIN events e ON e.id=p.event_id
                 LEFT JOIN event_numbers n ON n.event_id=e.id
-                LEFT JOIN sources s ON s.event_id=p.event_id AND s.url=p.source_url
+                LEFT JOIN sources s ON s.event_id=p.event_id AND s.url=CASE WHEN EXISTS(
+                    SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
+                    THEN e.official_url ELSE p.source_url END
                 WHERE p.date IS NOT NULL AND p.status!='cancelled'""")]
             deadlines = [dict(row) for row in db.execute("""SELECT t.*,e.title,e.brands_json,e.event_display,e.venue,n.public_number,
                     s.fetched_at AS source_fetched_at,s.quality AS source_quality

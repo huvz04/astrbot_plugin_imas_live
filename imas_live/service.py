@@ -94,18 +94,7 @@ class ImasLiveService:
                 if not self._fetchable_special_page(article.url):
                     continue
                 try:
-                    parsed = await self._collect_special(article)
-                    if not (parsed.ticket_rounds or parsed.performances):
-                        raise SourceUnavailable('专题未能解析，保留已知记录并暂停该来源提醒')
-                    digest = hashlib.sha256(json.dumps({
-                        'tickets': [row.record() for row in parsed.ticket_rounds],
-                        'performances': [vars_for_slots(row) for row in parsed.performances],
-                        'cast': [vars_for_slots(row) for row in parsed.cast],
-                    }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-                    changed += int(await asyncio.to_thread(self.db.save_parsed, article.cms_id, article.url, digest, "special-page-v2", parsed.ticket_rounds, parsed.performances, parsed.cast, parsed.review_notes))
-                    assets = await self._cache_roster_assets(article.cms_id, article.url, parsed.cast_asset_urls)
-                    if assets:
-                        await asyncio.to_thread(self.db.save_cast_assets, article.cms_id, article.url, assets)
+                    changed += int(await self._refresh_article(article))
                 except (httpx.HTTPError, SourceUnavailable, ValueError) as exc:
                     failed += 1; await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -116,6 +105,58 @@ class ImasLiveService:
             first = self.db.meta("baseline_complete") is None
             self.db.set_meta("baseline_complete", "1")
             return {"status": "ok", "events": len(articles), "changed_pages": changed, "failed_pages": failed, "baseline": first}
+
+    async def _refresh_article(self, article: CmsArticle) -> bool:
+        """Refresh one already-known official event without broad directory work."""
+        parsed = await self._collect_special(article)
+        if not (parsed.ticket_rounds or parsed.performances):
+            raise SourceUnavailable('专题未能解析，保留已知记录并暂停该来源提醒')
+        digest = hashlib.sha256(json.dumps({
+            'tickets': [row.record() for row in parsed.ticket_rounds],
+            'performances': [vars_for_slots(row) for row in parsed.performances],
+            'cast': [vars_for_slots(row) for row in parsed.cast],
+        }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        changed = await asyncio.to_thread(self.db.save_parsed, article.cms_id, article.url, digest, "special-page-v2", parsed.ticket_rounds, parsed.performances, parsed.cast, parsed.review_notes)
+        assets = await self._cache_roster_assets(article.cms_id, article.url, parsed.cast_asset_urls)
+        if assets:
+            await asyncio.to_thread(self.db.save_cast_assets, article.cms_id, article.url, assets)
+        return changed
+
+    async def refresh_open_ticket_sources(self, current: datetime | None = None) -> dict[str, int]:
+        """Bounded on-demand recheck for cached *active* lotteries only.
+
+        This makes a manual ticket query useful when the normal rotating
+        background job has not revisited a currently-open page within the
+        display freshness window.  It does not promote unverified rows.
+        """
+        zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
+        current = (current or datetime.now(zone)).astimezone(zone)
+        rows = await asyncio.to_thread(self.db.ticket_query_rows)
+        ids: list[str] = []
+        for row in rows:
+            try:
+                start, end = datetime.fromisoformat(row["application_start"]), datetime.fromisoformat(row["application_end"])
+                active = start.tzinfo and end.tzinfo and start <= current.astimezone(end.tzinfo) < end
+            except (TypeError, ValueError):
+                active = False
+            if active and not self._source_is_fresh(row, current):
+                ids.append(row["event_id"])
+        if not ids or self._sync_lock.locked():
+            return {"refreshed": 0, "failed": 0}
+        raw = await asyncio.to_thread(self.db.events_by_ids, ids[:max(1, int(self.config.get("ticket_query_refresh_max", 4)))])
+        articles = [CmsArticle(row["id"], row["title"], row["official_url"], json.loads(row["brands_json"]), row["event_display"], row["venue"], row["source_updated"], {}) for row in raw]
+        refreshed = failed = 0
+        async with self._sync_lock:
+            for article in articles:
+                if not self._fetchable_special_page(article.url):
+                    continue
+                try:
+                    await self._refresh_article(article)
+                    refreshed += 1
+                except (httpx.HTTPError, SourceUnavailable, ValueError) as exc:
+                    failed += 1
+                    await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+        return {"refreshed": refreshed, "failed": failed}
 
     async def _collect_special(self, article: CmsArticle) -> ParsedPage:
         """Follow actual links under this event only, including HTML meta redirects."""
@@ -346,7 +387,7 @@ class ImasLiveService:
         start, end, _ = self._month_window(current, None)
         rows = await asyncio.to_thread(self.db.ticket_query_rows)
         entries: list[dict[str, Any]] = []
-        missing_end = 0
+        time_unverified = invalid_range = stale_source = 0
         for row in rows:
             if not self._brand_allowed(row["brands_json"]):
                 continue
@@ -356,13 +397,16 @@ class ImasLiveService:
                 if deadline.tzinfo is None or application_start.tzinfo is None:
                     raise ValueError
             except (TypeError, ValueError):
-                missing_end += 1
+                time_unverified += 1
                 continue
             now_at_ticket_zone = current.astimezone(deadline.tzinfo)
             if not (application_start <= now_at_ticket_zone < deadline):
                 continue
-            if deadline <= application_start or not self._source_is_fresh(row, current):
-                missing_end += 1
+            if deadline <= application_start:
+                invalid_range += 1
+                continue
+            if not self._source_is_fresh(row, current):
+                stale_source += 1
                 continue
             remaining = deadline - now_at_ticket_zone
             ticket_status, status_label = ("urgent", "24小时内截止") if remaining <= timedelta(hours=24) else ("open", "正在抽选")
@@ -382,8 +426,15 @@ class ImasLiveService:
         priority = {"urgent": 0, "open": 1}
         entries.sort(key=lambda item: (priority[item["ticket_status"]], item["sort_time"], item["title"], item["subtitle"]))
         status = self._status(current, zone)
-        if missing_end:
-            status += f"｜{missing_end} 个轮次截止待核验"
+        diagnostics = []
+        if stale_source:
+            diagnostics.append(f"{stale_source} 个当前开放轮次的专题缓存待复核")
+        if time_unverified:
+            diagnostics.append(f"{time_unverified} 个轮次起止时间待核验")
+        if invalid_range:
+            diagnostics.append(f"{invalid_range} 个轮次时间范围异常")
+        if diagnostics:
+            status += "｜" + "；".join(diagnostics)
         return entries, start, end, status
 
     @staticmethod

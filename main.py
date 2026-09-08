@@ -249,7 +249,10 @@ class ImasLivePlugin(Star):
             if tokens:
                 yield event.plain_result("用法：/imasticket、/imasticket get <活动编号>、/imasticket enable|disable")
                 return
+            refresh = await self.service.refresh_open_ticket_sources()
             entries, start, end, status = await self.service.ticket_entries()
+            if refresh["failed"]:
+                status += f"｜{refresh['failed']} 个当前开放专题复核失败，未当作开放显示"
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
             image = await asyncio.to_thread(self.renderer.render_ticket, entries, start.date(), end.date(), now, status)
             links: list[str] = []

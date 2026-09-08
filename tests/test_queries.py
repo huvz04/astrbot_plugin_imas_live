@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from unittest.mock import AsyncMock
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -93,6 +94,32 @@ class QueryTests(unittest.TestCase):
             self.assertNotIn("轮次：已经截止", by_round)
             self.assertIn("北京时间", by_round["轮次：恰好24小时"]["subtitle"])
             self.assertIn("JST", by_round["轮次：恰好24小时"]["subtitle"])
+            asyncio.run(service.close())
+
+    def test_empty_ticket_status_distinguishes_stale_source_from_bad_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory), {"freshness_hours": 24})
+            evidence = Evidence("https://example.test/stale", "official", "test")
+            add_event(service, "stale-only", (), [TicketRound("round", "仍开放但缓存旧", "onsite", "lottery", "2026-09-01T00:00+09:00", "2026-09-20T23:59+09:00", evidence=evidence)], source_quality="stale")
+            entries, _, _, status = asyncio.run(service.ticket_entries(CURRENT))
+            self.assertEqual(entries, [])
+            self.assertIn("当前开放轮次的专题缓存待复核", status)
+            self.assertNotIn("截止待核验", status)
+            asyncio.run(service.close())
+
+    def test_manual_ticket_query_rechecks_only_active_stale_official_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory), {"freshness_hours": 24})
+            source = "https://idolmaster-official.jp/live_event/example/"
+            service.db.upsert_event({"id": "official-stale", "title": "官方仍开放", "brands": ["GAKUEN"], "url": source, "event_display": None, "venue": "会场", "updated": None})
+            ticket = TicketRound("round", "先行", "onsite", "lottery", "2026-09-01T00:00+09:00", "2026-09-20T23:59+09:00", evidence=Evidence(source, "official", "test"))
+            service.db.save_parsed("official-stale", source, "v1", "test", [ticket], [], [], [])
+            with service.db._connect() as db:
+                db.execute("UPDATE sources SET quality='stale' WHERE event_id='official-stale'")
+            service._refresh_article = AsyncMock(return_value=False)
+            result = asyncio.run(service.refresh_open_ticket_sources(CURRENT))
+            self.assertEqual(result, {"refreshed": 1, "failed": 0})
+            service._refresh_article.assert_awaited_once()
             asyncio.run(service.close())
 
     def test_ticket_renderer_keeps_all_statuses_in_one_long_png(self):
