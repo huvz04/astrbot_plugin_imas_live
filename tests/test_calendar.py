@@ -81,14 +81,14 @@ class CalendarTests(unittest.TestCase):
             self.assertTrue(restarted.group_enabled(disabled_umo))
             asyncio.run(restarted.close())
 
-    def test_calendar_includes_performance_and_remote_event_deadline(self):
+    def test_calendar_includes_only_performances(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = ImasLiveService(Path(tmp), {"display_timezone": "Asia/Shanghai"})
             seed(service)
-            entries, start, end, _ = asyncio.run(service.calendar_entries(datetime(2026, 9, 7, 10, tzinfo=ZoneInfo("Asia/Shanghai"))))
-            self.assertEqual((end.date() - start.date()).days, 29)
-            self.assertEqual({item["kind"] for item in entries}, {"performance", "deadline"})
-            self.assertTrue(any("北京时间" in item["subtitle"] and "2026/09/07" in item["subtitle"] for item in entries))
+            entries, start, end, _, title = asyncio.run(service.calendar_entries(datetime(2026, 9, 7, 10, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            self.assertEqual((end.date() - start.date()).days, 30)
+            self.assertEqual({item["kind"] for item in entries}, {"performance"})
+            self.assertEqual(title, "未来30天 LIVE")
             self.assertTrue(any("福冈会场" in item["subtitle"] for item in entries if item["kind"] == "performance"))
             asyncio.run(service.close())
 

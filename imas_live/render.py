@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import re
 import time
@@ -104,26 +104,36 @@ class CalendarRenderer:
         labels = self._wrap(draw, label, self.font(20, True), width - 270)
         title = self._wrap(draw, entry["title"], self.font(28, True), width)
         deadline = entry.get("kind") == "deadline" or reminder
+        ticket = entry.get("kind") == "ticket"
+        ticket_status = entry.get("ticket_status", "")
+        fills = {"urgent": ("#fff3f3", "#efb8b8", "#b93863"),
+                 "open": ("#effaf2", "#b7dfc2", "#23834a"),
+                 "upcoming": ("#f4f6f8", "#d6dce3", "#657187"),
+                 "unknown": ("#f4f6f8", "#d6dce3", "#657187"),
+                 "stale": ("#f4f6f8", "#d6dce3", "#657187")}
+        fill, outline, badge_color = fills.get(ticket_status, ("#fff3f3" if deadline else "white", "#e4b4be" if deadline else "#e3e8f1", "#b93863"))
         subtitle = entry["subtitle"]
         if reminder:
             subtitle += f"\n剩余约 {entry['remaining_minutes']} 分钟"
         sub = self._wrap(draw, subtitle, self.font(22), width)
         return {"color": color, "labels": labels, "title": title, "sub": sub, "deadline": deadline,
+                "ticket": ticket, "fill": fill, "outline": outline, "badge_color": badge_color,
+                "status_label": entry.get("status_label", "抽票截止" if deadline else ""),
                 "height": 48 + 30 * len(labels) + 39 * len(title) + 31 * len(sub)}
 
     def _draw_card(self, draw, card: dict, y: int) -> None:
         left, right = self.margin, self.width - self.margin
-        deadline = card['deadline']
         draw.rounded_rectangle((left, y, right, y + card["height"]), radius=18,
-                               fill='#fff3f3' if deadline else 'white', outline='#e4b4be' if deadline else '#e3e8f1')
+                               fill=card['fill'], outline=card['outline'])
         draw.rounded_rectangle((left, y, left + 14, y + card["height"]), radius=7, fill=card["color"])
-        badge = '抽票截止 · 非演出日' if deadline else 'LIVE 演出'
-        font = self.font(21, True)
-        badge_width = round(draw.textlength(badge, font=font)) + 28
-        draw.rounded_rectangle((right - badge_width - 24, y + 18, right - 24, y + 50), radius=8,
-                               fill='#b93863' if deadline else '#e9eff7')
-        draw.text((right - badge_width - 10, self._centered_text_y(y + 18, 32, draw.textbbox((0, 0), badge, font=font))),
-                  badge, font=font, fill='white' if deadline else '#263651')
+        badge = card['status_label']
+        if badge:
+            font = self.font(20, True)
+            badge_width = round(draw.textlength(badge, font=font)) + 28
+            draw.rounded_rectangle((right - badge_width - 24, y + 18, right - 24, y + 50), radius=8,
+                                   fill=card['badge_color'])
+            draw.text((right - badge_width - 10, self._centered_text_y(y + 18, 32, draw.textbbox((0, 0), badge, font=font))),
+                      badge, font=font, fill='white')
         cursor = y + 20
         for label in card["labels"]:
             font = self.font(20, True)
@@ -147,13 +157,14 @@ class CalendarRenderer:
         # Only our own aged render files are eligible for cleanup.
         for old in self.output_dir.glob("*.png"):
             try:
-                if old.name.startswith(("calendar-", "deadline-")) and time.time() - old.stat().st_mtime > 7 * 86400:
+                if old.name.startswith(("calendar-", "deadline-", "ticket-")) and time.time() - old.stat().st_mtime > 7 * 86400:
                     old.unlink()
             except OSError:
                 pass
         return path
 
-    def render_calendar(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime, status: str = "") -> list[Path]:
+    def render_calendar(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime,
+                        status: str = "", title: str = "未来30天 LIVE") -> list[Path]:
         # One measured canvas keeps the complete 30-day window in a single image.
         cards = [(entry['display_date'], self._card_layout(entry))
                  for entry in sorted(entries, key=lambda row: row['display_date'])]
@@ -163,16 +174,12 @@ class CalendarRenderer:
         image = Image.new('RGB', (self.width, height), '#f5f7fb')
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, self.header_height), fill='#172033')
-        draw.text((48, 28), 'IMAS LIVE！未来30天', font=self.font(42, True), fill='white')
+        draw.text((48, 28), title, font=self.font(42, True), fill='white')
         zone = '北京时间' if str(generated_at.tzinfo) == 'Asia/Shanghai' else str(generated_at.tzinfo)
-        draw.text((48, 92), f'{zone} {start:%Y.%m.%d} — {end:%Y.%m.%d}', font=self.font(26), fill='#c8d3e6')
-        performance_count = sum(not card['deadline'] for _, card in cards)
-        deadline_count = len(cards) - performance_count
-        draw.text((48, 145), f'完整日历 · LIVE 演出 {performance_count} 条 · 抽票截止 {deadline_count} 条',
-                  font=self.font(22), fill='#c8d3e6')
+        draw.text((48, 92), f'{zone} {start:%Y.%m.%d} — {(end - timedelta(days=1)):%Y.%m.%d}', font=self.font(26), fill='#c8d3e6')
         y = self.header_height + 28
         if not cards:
-            message = '数据尚未同步完成，请稍后再发送 /imaslive。' if '尚未同步' in status else '这 30 天内暂无已收录的演出或抽票截止。'
+            message = '数据尚未同步完成，请稍后再发送 /imaslive。' if '尚未同步' in status else '此范围内暂无已收录的演出。'
             draw.text((48, 276), message, font=self.font(30, True), fill='#25324a')
         last_day = None
         for day, card in cards:
@@ -189,6 +196,30 @@ class CalendarRenderer:
             draw.text((48, height - 86 + 27 * number), line, font=self.font(19), fill='#657187')
         draw.text((48, height - 30), '仅统计已收录信息 · 预告场次以官网为准', font=self.font(18), fill='#657187')
         return [self._save(image, 'calendar')]
+
+    def render_ticket(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime,
+                      status: str = "") -> Path:
+        cards = [self._card_layout(entry) for entry in entries]
+        header_height = 204
+        height = max(620, header_height + 36 + sum(card['height'] + 18 for card in cards) + 110)
+        image = Image.new('RGB', (self.width, height), '#f5f7fb')
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, self.width, header_height), fill='#172033')
+        draw.text((48, 28), '近期现场抽选', font=self.font(42, True), fill='white')
+        draw.text((48, 90), '当前开放 + 未来30天将开放', font=self.font(26), fill='#c8d3e6')
+        zone = '北京时间' if str(generated_at.tzinfo) == 'Asia/Shanghai' else str(generated_at.tzinfo)
+        draw.text((48, 136), f'{zone} {start:%Y.%m.%d} — {(end - timedelta(days=1)):%Y.%m.%d}', font=self.font(22), fill='#c8d3e6')
+        y = header_height + 28
+        if not cards:
+            message = '数据尚未同步完成，请稍后再发送 /imasticket。' if '尚未同步' in status else '近期暂无已核验的现场抽选。'
+            draw.text((48, y + 48), message, font=self.font(30, True), fill='#25324a')
+        for card in cards:
+            self._draw_card(draw, card, y)
+            y += card['height'] + 18
+        for number, line in enumerate(self._wrap(draw, status or '尚未同步', self.font(19), self.width - 96)[:2]):
+            draw.text((48, height - 86 + 27 * number), line, font=self.font(19), fill='#657187')
+        draw.text((48, height - 30), '状态以官方申请页面为准', font=self.font(18), fill='#657187')
+        return self._save(image, 'ticket')
 
     def render_reminder(self, rows: list[dict[str, Any]], generated_at: datetime) -> Path:
         cards = [self._card_layout(row, True) for row in rows]

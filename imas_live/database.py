@@ -283,3 +283,21 @@ class Database:
                 WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.application_end IS NOT NULL
                   AND t.quality='verified'""")]
         return performances, deadlines
+
+    def ticket_query_rows(self) -> list[dict[str, Any]]:
+        """Return every verified onsite lottery round with source freshness evidence."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT t.*,e.title,e.brands_json,e.venue AS event_venue,
+                    s.fetched_at AS source_fetched_at,s.quality AS source_quality,
+                    MIN(p.date) AS performance_date,
+                    COALESCE(MIN(NULLIF(p.venue,'')), e.venue) AS performance_venue
+                FROM ticket_rounds t
+                JOIN events e ON e.id=t.event_id
+                LEFT JOIN performances p ON p.event_id=e.id AND p.date IS NOT NULL AND p.status!='cancelled'
+                LEFT JOIN sources s ON s.event_id=e.id AND s.url=CASE WHEN EXISTS(
+                    SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
+                    THEN e.official_url ELSE t.source_url END
+                WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.quality='verified'
+                GROUP BY t.id
+                ORDER BY t.application_end IS NULL,t.application_end,t.application_start,t.id""").fetchall()
+        return [dict(row) for row in rows]

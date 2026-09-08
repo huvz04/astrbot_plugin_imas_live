@@ -219,13 +219,37 @@ class ImasLiveService:
         jst = deadline.astimezone(ZoneInfo('Asia/Tokyo'))
         return f"截止：{local:%Y/%m/%d %H:%M} {name} / {jst:%m/%d %H:%M} JST", local
 
-    async def calendar_entries(self, current: datetime | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str]:
-        """Build the rolling 30-day presentation model independently of network sync."""
+    @staticmethod
+    def _month_window(current: datetime, month: int | None) -> tuple[datetime, datetime, str]:
+        """Return a left-closed, right-open local query window and its image title."""
+        if month is None:
+            start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            return start, start + timedelta(days=30), "未来30天 LIVE"
+        year = current.year if month >= current.month else current.year + 1
+        start = current.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = start.replace(year=start.year + 1, month=1) if month == 12 else start.replace(month=month + 1)
+        return start, end, f"{year}年{month}月 LIVE"
+
+    def _status(self, current: datetime, zone: ZoneInfo) -> str:
+        last = self.db.meta("last_directory_sync") or self.db.meta('last_successful_sync')
+        if not last:
+            return "尚未同步"
+        try:
+            is_stale = current.astimezone(timezone.utc) - datetime.fromisoformat(last) > timedelta(hours=int(self.config.get("freshness_hours", 12)))
+            local_stamp = datetime.fromisoformat(last).astimezone(zone)
+            status = ("缓存陈旧｜" if is_stale else "目录更新 ") + local_stamp.strftime('%Y/%m/%d %H:%M')
+        except ValueError:
+            status = "核验时间格式异常"
+        if self.db.meta('last_error'):
+            status += '｜部分来源待核验'
+        return status
+
+    async def calendar_entries(self, current: datetime | None = None, month: int | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str, str]:
+        """Return only performances in either the default 30-day or requested-month window."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
-        start = current.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + timedelta(days=29)
-        performances, deadlines = await asyncio.to_thread(self.db.calendar_rows)
+        start, end, title = self._month_window(current, month)
+        performances, _ = await asyncio.to_thread(self.db.calendar_rows)
         entries: list[dict[str, Any]] = []
         for row in performances:
             if not self._brand_allowed(row["brands_json"]):
@@ -234,35 +258,90 @@ class ImasLiveService:
                 display_day = datetime.strptime(row["date"], "%Y-%m-%d").date()
             except ValueError:
                 continue
-            if start.date() <= display_day <= end.date():
+            if start.date() <= display_day < end.date():
                 venue = clean(row["venue"] or row["event_venue"] or "场馆待核验")
                 session = row["session_label"] or "场次待核验"
                 entries.append({"kind": "performance", "display_date": row["date"], "title": row["title"],
                                 "subtitle": f"{session}｜{venue}", "brands": json.loads(row["brands_json"]), "url": row["source_url"]})
-        for row in deadlines:
+        entries.sort(key=lambda item: (item["display_date"], item["title"], item["subtitle"]))
+        return entries, start, end, self._status(current, zone), title
+
+    @staticmethod
+    def _ticket_time(value: str, label: str, zone: ZoneInfo) -> str:
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            raise ValueError("票务时间缺少时区")
+        local = moment.astimezone(zone)
+        jst = moment.astimezone(ZoneInfo("Asia/Tokyo"))
+        zone_name = "北京时间" if zone.key == "Asia/Shanghai" else zone.key
+        return f"{label}：{local:%Y/%m/%d %H:%M} {zone_name} / {jst:%Y/%m/%d %H:%M} JST"
+
+    def _source_is_fresh(self, row: dict[str, Any], current: datetime) -> bool:
+        try:
+            fetched = datetime.fromisoformat(row["source_fetched_at"])
+            return row["source_quality"] == "verified" and fetched.tzinfo is not None and current.astimezone(timezone.utc) - fetched.astimezone(timezone.utc) <= timedelta(hours=max(1, int(self.config.get("freshness_hours", 12))))
+        except (TypeError, ValueError):
+            return False
+
+    async def ticket_entries(self, current: datetime | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str]:
+        """Build action-oriented cards for current and soon-opening onsite lotteries."""
+        zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
+        current = (current or datetime.now(zone)).astimezone(zone)
+        start, end, _ = self._month_window(current, None)
+        rows = await asyncio.to_thread(self.db.ticket_query_rows)
+        entries: list[dict[str, Any]] = []
+        missing_end = 0
+        for row in rows:
             if not self._brand_allowed(row["brands_json"]):
                 continue
             try:
-                text, local = self._display_deadline(row["application_end"], zone)
-            except ValueError:
+                deadline = datetime.fromisoformat(row["application_end"])
+                if deadline.tzinfo is None or deadline <= current.astimezone(deadline.tzinfo):
+                    continue
+            except (TypeError, ValueError):
+                missing_end += 1
                 continue
-            if start.date() <= local.date() <= end.date():
-                entries.append({"kind": "deadline", "display_date": local.date().isoformat(), "title": row["title"],
-                                "subtitle": f"{row['name']}｜{text}", "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"]})
-        entries.sort(key=lambda item: (item["display_date"], item["kind"] != "deadline", item["title"]))
-        last = self.db.meta("last_directory_sync") or self.db.meta('last_successful_sync')
-        if not last:
-            status = "尚未同步"
-        else:
             try:
-                is_stale = current.astimezone(timezone.utc) - datetime.fromisoformat(last) > timedelta(hours=int(self.config.get("freshness_hours", 12)))
-                local_stamp = datetime.fromisoformat(last).astimezone(zone)
-                status = ("缓存陈旧｜" if is_stale else "目录更新 ") + local_stamp.strftime('%Y/%m/%d %H:%M')
+                application_start = datetime.fromisoformat(row["application_start"]) if row["application_start"] else None
+                if application_start and application_start.tzinfo is None:
+                    application_start = None
             except ValueError:
-                status = "核验时间格式异常"
-        error = self.db.meta('last_error')
-        if error:
-            status += '｜部分来源待核验'
+                application_start = None
+            now_at_ticket_zone = current.astimezone(deadline.tzinfo)
+            if application_start and deadline <= application_start:
+                continue
+            if application_start is None:
+                local_deadline = deadline.astimezone(zone)
+                if not (start <= local_deadline < end):
+                    continue
+                ticket_status, status_label = "unknown", "开放状态待核验"
+            elif application_start <= now_at_ticket_zone:
+                remaining = deadline - now_at_ticket_zone
+                ticket_status, status_label = ("urgent", "24小时内截止") if remaining <= timedelta(hours=24) else ("open", "正在抽选")
+            elif application_start < end.astimezone(application_start.tzinfo):
+                ticket_status, status_label = "upcoming", "即将开始"
+            else:
+                continue
+            if not self._source_is_fresh(row, current):
+                ticket_status, status_label = "stale", "缓存待核验"
+            details = [f"轮次：{row['name']}"]
+            if application_start:
+                details.append(self._ticket_time(row["application_start"], "开始", zone))
+            details.append(self._ticket_time(row["application_end"], "截止", zone))
+            if row.get("performance_date") or row.get("performance_venue"):
+                details.append("演出：" + "｜".join(part for part in (
+                    str(row["performance_date"]).replace("-", "/") if row.get("performance_date") else "",
+                    clean(row["performance_venue"] or "") if row.get("performance_venue") else "",
+                ) if part))
+            entries.append({"kind": "ticket", "title": row["title"], "subtitle": "\n".join(details),
+                            "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"],
+                            "ticket_status": ticket_status, "status_label": status_label,
+                            "sort_time": deadline if ticket_status in {"urgent", "open", "unknown", "stale"} else application_start})
+        priority = {"urgent": 0, "open": 1, "upcoming": 2, "unknown": 3, "stale": 3}
+        entries.sort(key=lambda item: (priority[item["ticket_status"]], item["sort_time"], item["title"], item["subtitle"]))
+        status = self._status(current, zone)
+        if missing_end:
+            status += f"｜{missing_end} 个轮次截止待核验"
         return entries, start, end, status
 
     async def claim_due_reminders(self, current: datetime | None = None) -> list[dict[str, Any]]:

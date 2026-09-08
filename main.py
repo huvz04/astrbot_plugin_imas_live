@@ -1,9 +1,10 @@
-"""A single-command IM@S live calendar plus one-shot lottery-deadline images."""
+"""IM@S performance calendars, ticket-query cards, and one-shot deadline reminders."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -19,6 +20,19 @@ from .imas_live.render import CalendarRenderer
 from .imas_live.service import ImasLiveService
 
 PLUGIN_NAME = "astrbot_plugin_imas_live"
+
+
+def parse_live_month(argument: str) -> int | None:
+    """Accept one integer month only; None means the rolling 30-day view."""
+    parts = argument.split()
+    if not parts:
+        return None
+    if len(parts) != 1 or not re.fullmatch(r"\d+", parts[0]):
+        raise ValueError
+    month = int(parts[0])
+    if not 1 <= month <= 12:
+        raise ValueError
+    return month
 
 
 class ImasLivePlugin(Star):
@@ -87,24 +101,57 @@ class ImasLivePlugin(Star):
                 logger.exception("IM@S deadline cycle failed")
                 await asyncio.sleep(30)
 
+    async def _wait_for_first_directory(self, event: AstrMessageEvent) -> None:
+        await self.initialize()
+        if not self.service.db.meta('last_directory_sync') and self.config.get('enabled', True):
+            yield event.plain_result('正在首次同步官网活动，稍候生成日历。')
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.service.directory_ready.wait(), timeout=40)
+
     @filter.command("imaslive")
-    async def imaslive(self, event: AstrMessageEvent):
-        """显示今天起 30 个自然日的 PNG 列表日历。"""
+    async def imaslive(self, event: AstrMessageEvent, month_argument: str = ""):
+        """显示未来30天或指定完整自然月的演出长图。"""
         event.stop_event()
         try:
-            await self.initialize()
-            if not self.service.db.meta('last_directory_sync') and self.config.get('enabled', True):
-                yield event.plain_result('正在首次同步官网活动，稍候生成日历。')
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self.service.directory_ready.wait(), timeout=40)
-            entries, start, end, status = await self.service.calendar_entries()
+            try:
+                month = parse_live_month(month_argument)
+            except ValueError:
+                yield event.plain_result('用法：/imaslive 或 /imaslive 1—12')
+                return
+            async for response in self._wait_for_first_directory(event):
+                yield response
+            entries, start, end, status, title = await self.service.calendar_entries(month=month)
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
-            images = await asyncio.to_thread(self.renderer.render_calendar, entries, start.date(), end.date(), now, status)
+            images = await asyncio.to_thread(self.renderer.render_calendar, entries, start.date(), end.date(), now, status, title)
             for image in images:
                 yield event.image_result(str(image))
         except Exception:
             logger.exception("IM@S calendar image rendering failed")
             yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
+
+    @filter.command("imasticket")
+    async def imasticket(self, event: AstrMessageEvent):
+        """显示当前开放与未来30天即将开放的现场抽选。"""
+        event.stop_event()
+        try:
+            async for response in self._wait_for_first_directory(event):
+                yield response
+            entries, start, end, status = await self.service.ticket_entries()
+            now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
+            image = await asyncio.to_thread(self.renderer.render_ticket, entries, start.date(), end.date(), now, status)
+            links: list[str] = []
+            seen: set[str] = set()
+            for entry in entries:
+                url = str(entry.get('url') or '')
+                if url and url not in seen:
+                    seen.add(url)
+                    links.append(f"{entry['title']}｜{entry['subtitle'].splitlines()[0].removeprefix('轮次：')}：{url}")
+            if links:
+                yield event.plain_result('官方申请链接：\n' + '\n'.join(links))
+            yield event.image_result(str(image))
+        except Exception:
+            logger.exception("IM@S ticket image rendering failed")
+            yield event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。")
 
     async def terminate(self):
         for task in (self._sync_task, self._reminder_task):

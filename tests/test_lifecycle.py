@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from imas_live.service import ImasLiveService
 
 
-def plugin_class():
+def plugin_module():
     names = ['astrbot', 'astrbot.api', 'astrbot.api.event', 'astrbot.api.star',
              'astrbot.core', 'astrbot.core.utils', 'astrbot.core.utils.astrbot_path', '_live_test']
     modules = {name: types.ModuleType(name) for name in names}
@@ -29,10 +29,23 @@ def plugin_class():
         spec = importlib.util.spec_from_file_location('_live_test.main', root / 'main.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-    return module.ImasLivePlugin
+    return module
+
+
+def plugin_class():
+    return plugin_module().ImasLivePlugin
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_month_argument_accepts_one_integer_only(self):
+        parser = plugin_module().parse_live_month
+        self.assertIsNone(parser(""))
+        self.assertEqual(parser("01"), 1)
+        self.assertEqual(parser("12"), 12)
+        for invalid in ("0", "13", "-1", "1.5", "abc", "1 2"):
+            with self.assertRaises(ValueError):
+                parser(invalid)
+
     async def test_reload_starts_once_and_first_query_waits_for_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             cls = plugin_class()
