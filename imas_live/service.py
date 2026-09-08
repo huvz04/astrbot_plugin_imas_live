@@ -438,7 +438,21 @@ class ImasLiveService:
             # An event-level list is relevant only when no day-specific list exists.
             if not cast:
                 cast = [item for item in detail["cast"] if not item.get("performance_id")]
-        assets = await asyncio.to_thread(self.db.cast_assets, row["event_id"])
+        assets = await asyncio.to_thread(self.db.cast_asset_rows, row["event_id"])
+        day_match = re.search(r"DAY\s*(\d+)", str(row.get("session_label") or ""), re.I)
+        day_number = day_match.group(1) if day_match else None
+        asset_paths = []
+        for asset in assets:
+            # Do not send Million's DAY2 roster for a DAY1 query.  Assets that
+            # do not identify a day are only used when the performance itself
+            # has no day label.
+            image_day = re.search(r"bnr_day(\d+)\.webp", asset["image_url"], re.I)
+            if day_number and image_day and image_day.group(1) != day_number:
+                continue
+            if day_number and not image_day:
+                continue
+            if Path(asset["cached_path"]).is_file():
+                asset_paths.append(asset["cached_path"])
         venue = clean(row.get("venue") or row.get("event_venue") or "场馆待核验")
         time_text = f"{moment:%Y/%m/%d %H:%M} {'北京时间' if zone.key == 'Asia/Shanghai' else zone.key}" if precise else f"{moment:%Y/%m/%d}｜开演时间待公布/待核验"
         return {"kind": "performance", "display_date": row["date"], "title": row["title"],
@@ -446,7 +460,7 @@ class ImasLiveService:
                 "brands": json.loads(row["brands_json"]), "url": row.get("source_url") or "",
                 "public_number": row.get("public_number"), "cast": cast, "precise": precise,
                 "official_url": detail["event"].get("official_url") if detail else row.get("source_url"),
-                "cast_assets": [path for path in assets if Path(path).is_file()]}
+                "cast_assets": asset_paths}
 
     async def ticket_detail(self, number: int, current: datetime | None = None) -> dict[str, Any] | None:
         """Return an event even when all lottery rounds have ended."""

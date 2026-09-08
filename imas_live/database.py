@@ -208,6 +208,11 @@ class Database:
             rows = db.execute("SELECT cached_path FROM cast_assets WHERE event_id=? ORDER BY image_url", (event_id,)).fetchall()
         return [row["cached_path"] for row in rows]
 
+    def cast_asset_rows(self, event_id: str) -> list[dict[str, str]]:
+        with self._connect() as db:
+            rows = db.execute("SELECT image_url,cached_path FROM cast_assets WHERE event_id=? ORDER BY image_url", (event_id,)).fetchall()
+        return [dict(row) for row in rows]
+
     def list_events(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute("""SELECT e.*, COUNT(DISTINCT p.id) performance_count FROM events e
