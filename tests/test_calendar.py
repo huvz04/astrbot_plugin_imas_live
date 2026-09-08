@@ -42,19 +42,23 @@ class CalendarTests(unittest.TestCase):
             visible_center = text_top + (bbox[1] + bbox[3]) / 2
             self.assertAlmostEqual(visible_center, 35, delta=0.5)
 
-    def test_many_same_day_entries_paginate_without_losing_cards(self):
+    def test_busy_month_and_late_shiny_dates_stay_in_one_image(self):
         with tempfile.TemporaryDirectory() as tmp:
             renderer = CalendarRenderer(Path(tmp))
             now = datetime(2026, 9, 8, tzinfo=ZoneInfo('Asia/Shanghai'))
             rows = [{'kind': 'performance', 'display_date': '2026-09-08', 'title': f'演出 {i}',
                      'subtitle': '场次示例', 'brands': ['SIDEM']} for i in range(25)]
+            rows += [{'kind': 'performance', 'display_date': f'2026-09-{day}', 'title': 'Shiny Master ShowPiece',
+                      'subtitle': f'DAY{day-25}', 'brands': ['SHINYCOLORS']} for day in (26, 27)]
             with patch.object(renderer, '_draw_card', wraps=renderer._draw_card) as draw_card:
-                paths = renderer.render_calendar(rows, now.date(), now.date(), now, '测试')
-            self.assertEqual(draw_card.call_count, 25)
-            self.assertGreater(len(paths), 1)
-            for path in paths:
-                with Image.open(path) as image:
-                    self.assertLessEqual(image.height, 1840)
+                paths = renderer.render_calendar(rows, now.date(), now.date().replace(month=10, day=7), now, '测试')
+            self.assertEqual(draw_card.call_count, 27)
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(draw_card.call_args_list[-1].args[1]['title'], ['Shiny Master ShowPiece'])
+            with Image.open(paths[0]) as image:
+                self.assertGreater(image.height, 1840)
+                last_card = draw_card.call_args_list[-1].args
+                self.assertLess(last_card[2] + last_card[1]['height'], image.height - 86)
 
     def test_group_switch_persists_and_blocks_only_that_group(self):
         with tempfile.TemporaryDirectory() as tmp:
