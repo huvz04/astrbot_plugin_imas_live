@@ -159,11 +159,13 @@ class ImasLivePlugin(Star):
                 await asyncio.wait_for(self.service.directory_ready.wait(), timeout=40)
 
     @filter.command("imaslive")
-    async def imaslive(self, event: AstrMessageEvent, month_argument: str = ""):
+    async def imaslive(self, event: AstrMessageEvent, action: str = "", value: str = ""):
         """显示未来30天或指定完整自然月的演出长图。"""
         event.stop_event()
         try:
-            tokens = month_argument.split()
+            # AstrBot binds command arguments positionally.  Separate parameters
+            # keep `/imaslive next gk` from losing the project argument.
+            tokens = [part for part in (action, value) if part]
             command = tokens[0].casefold() if tokens else ""
             if command in {"enable", "disable"}:
                 umo = self._group_umo(event)
@@ -196,7 +198,7 @@ class ImasLivePlugin(Star):
                 yield self._image_and_links(event, image[0], links, entry.get("cast_assets"))
                 return
             try:
-                month = parse_live_month(month_argument)
+                month = parse_live_month(" ".join(tokens))
             except ValueError:
                 yield event.plain_result('用法：/imaslive、/imaslive 1—12、/imaslive next [企划]、/imaslive enable|disable')
                 return
@@ -212,11 +214,13 @@ class ImasLivePlugin(Star):
             yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
 
     @filter.command("imasticket")
-    async def imasticket(self, event: AstrMessageEvent, ticket_argument: str = ""):
+    async def imasticket(self, event: AstrMessageEvent, action: str = "", value: str = ""):
         """Display current lotteries, a numbered historical lookup, or subscription state."""
         event.stop_event()
         try:
-            tokens = ticket_argument.split()
+            # AstrBot binds command arguments positionally.  Separate parameters
+            # keep `/imasticket get 2` from dropping the ticket number.
+            tokens = [part for part in (action, value) if part]
             command = tokens[0].casefold() if tokens else ""
             if command in {"enable", "disable"}:
                 umo = self._group_umo(event)

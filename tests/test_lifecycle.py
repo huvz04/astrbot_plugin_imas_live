@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from imas_live.service import ImasLiveService
 
@@ -45,6 +45,35 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         for invalid in ("0", "13", "-1", "1.5", "abc", "1 2"):
             with self.assertRaises(ValueError):
                 parser(invalid)
+
+    async def test_ticket_get_receives_action_and_number_as_separate_arguments(self):
+        """AstrBot supplies command words as separate positional arguments."""
+        cls = plugin_class()
+        plugin = cls.__new__(cls)
+        plugin.config = {"display_timezone": "Asia/Shanghai"}
+        plugin.service = Mock()
+        plugin.service.ticket_detail = AsyncMock(return_value={
+            "event": {"official_url": "https://example.test/event"},
+            "tickets": [{"url": "https://example.test/ticket"}],
+            "cast": [],
+        })
+        plugin.renderer = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "ticket.png"
+            image.touch()
+            plugin.renderer.render_ticket.return_value = image
+
+            async def already_ready(_event):
+                if False:
+                    yield None
+
+            plugin._wait_for_first_directory = already_ready
+            event = Mock()
+            event.chain_result.side_effect = lambda chain: ("chain", chain)
+            responses = [response async for response in plugin.imasticket(event, "get", "2")]
+
+        plugin.service.ticket_detail.assert_awaited_once_with(2)
+        self.assertEqual([response[0] for response in responses], ["chain"])
 
     async def test_reload_starts_once_and_first_query_waits_for_directory(self):
         with tempfile.TemporaryDirectory() as directory:
