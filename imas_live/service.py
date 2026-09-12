@@ -7,6 +7,7 @@ import csv
 import hashlib
 import importlib
 import json
+import logging
 import re
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ BRAND_COMMANDS = {
     "sm": "SIDEM", "sc": "SHINYCOLORS", "gk": "GAKUEN",
 }
 REMINDER_WINDOW_MINUTES = 6  # five-minute worker plus modest scheduler jitter
+logger = logging.getLogger(__name__)
 
 
 class ImasLiveService:
@@ -100,8 +102,13 @@ class ImasLiveService:
                     continue
                 try:
                     changed += int(await self._refresh_article(article))
-                except (httpx.HTTPError, SourceUnavailable, ValueError) as exc:
-                    failed += 1; await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
+                except Exception as exc:
+                    # One malformed official page (including a database identity
+                    # conflict) must not abort the remaining rotating sources.
+                    # source_error persists the event and URL for WebUI/log review.
+                    failed += 1
+                    logger.exception("IM@S source refresh failed: event=%s source=%s", article.cms_id, article.url)
+                    await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self.db.set_meta("last_successful_sync", stamp)
             with self.db._connect() as db:
@@ -158,8 +165,9 @@ class ImasLiveService:
                 try:
                     await self._refresh_article(article)
                     refreshed += 1
-                except (httpx.HTTPError, SourceUnavailable, ValueError) as exc:
+                except Exception as exc:
                     failed += 1
+                    logger.exception("IM@S on-demand source refresh failed: event=%s source=%s", article.cms_id, article.url)
                     await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
         return {"refreshed": refreshed, "failed": failed}
 

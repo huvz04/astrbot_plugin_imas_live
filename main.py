@@ -44,22 +44,6 @@ def parse_live_month(argument: str) -> int | None:
     return month
 
 
-def _allow_nonempty_command_group(group):
-    """Keep a native command group from consuming its public query command.
-
-    AstrBot command groups normally render their help tree for the bare group
-    name.  These two groups deliberately retain a same-named public query
-    command (`/imaslive` and `/imasticket`), so only the exact bare group name
-    is declined here.  Subcommands remain native group children and therefore
-    keep their WebUI enable/rename and permission metadata.
-    """
-    class NonEmptyGroup(filter.CustomFilter):
-        def filter(self, event: AstrMessageEvent, _config) -> bool:
-            message = event.get_message_str().strip()
-            return message not in group.parent_group.get_complete_command_names()
-    return NonEmptyGroup
-
-
 class ImasLivePlugin(Star):
     """Keep group interaction deliberately small: only /imaslive returns PNG pages."""
 
@@ -172,14 +156,6 @@ class ImasLivePlugin(Star):
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.service.directory_ready.wait(), timeout=40)
 
-    @filter.command_group("imaslive")
-    def imaslive_group(self):
-        """LIVE 查询、下一场与群订阅管理。"""
-        pass
-
-    # The group and query share their public root intentionally; see helper.
-    imaslive_group.custom_filter(_allow_nonempty_command_group(imaslive_group), False)(imaslive_group)
-
     @filter.command("imaslive")
     async def imaslive(self, event: AstrMessageEvent, month_argument: str = "", extra_argument: str = ""):
         """显示未来30天或指定完整自然月的演出长图。"""
@@ -205,7 +181,7 @@ class ImasLivePlugin(Star):
             logger.exception("IM@S calendar image rendering failed")
             yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
 
-    @imaslive_group.command("next")
+    @filter.command("imaslive next")
     async def imaslive_next(self, event: AstrMessageEvent, brand: str = "", extra_argument: str = ""):
         """显示下一场已收录 LIVE；可选 imas/cg/ml/sidem/sc/gk。"""
         event.stop_event()
@@ -232,7 +208,7 @@ class ImasLivePlugin(Star):
             yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @imaslive_group.command("enable")
+    @filter.command("imaslive enable")
     async def imaslive_enable(self, event: AstrMessageEvent, extra_argument: str = ""):
         """管理员：开启本群 LIVE 开演提醒与新增现场抽选公告。"""
         event.stop_event()
@@ -247,7 +223,7 @@ class ImasLivePlugin(Star):
         yield event.plain_result("已开启本群 LIVE 开演提醒与新增现场抽选公告。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @imaslive_group.command("disable")
+    @filter.command("imaslive disable")
     async def imaslive_disable(self, event: AstrMessageEvent, extra_argument: str = ""):
         """管理员：关闭本群 LIVE 开演提醒与新增现场抽选公告。"""
         event.stop_event()
@@ -260,13 +236,6 @@ class ImasLivePlugin(Star):
             return
         self.service.set_subscription("live", umo, False)
         yield event.plain_result("已关闭本群 LIVE 开演提醒与新增现场抽选公告。")
-
-    @filter.command_group("imasticket")
-    def imasticket_group(self):
-        """抽票查询、历史详情与群截止提醒订阅管理。"""
-        pass
-
-    imasticket_group.custom_filter(_allow_nonempty_command_group(imasticket_group), False)(imasticket_group)
 
     @filter.command("imasticket")
     async def imasticket(self, event: AstrMessageEvent, action: str = "", extra_argument: str = ""):
@@ -298,7 +267,7 @@ class ImasLivePlugin(Star):
             logger.exception("IM@S ticket image rendering failed")
             yield event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。")
 
-    @imasticket_group.command("get")
+    @filter.command("imasticket get")
     async def imasticket_get(self, event: AstrMessageEvent, ticket_number: int, extra_argument: str = ""):
         """按活动编号查看已收录的历史现场票务。"""
         event.stop_event()
@@ -323,7 +292,7 @@ class ImasLivePlugin(Star):
             yield event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @imasticket_group.command("enable")
+    @filter.command("imasticket enable")
     async def imasticket_enable(self, event: AstrMessageEvent, extra_argument: str = ""):
         """管理员：开启本群抽票截止提醒。"""
         event.stop_event()
@@ -338,7 +307,7 @@ class ImasLivePlugin(Star):
         yield event.plain_result("已开启本群抽票截止提醒（截止前 24 小时和 1 小时各一次）。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @imasticket_group.command("disable")
+    @filter.command("imasticket disable")
     async def imasticket_disable(self, event: AstrMessageEvent, extra_argument: str = ""):
         """管理员：关闭本群抽票截止提醒。"""
         event.stop_event()

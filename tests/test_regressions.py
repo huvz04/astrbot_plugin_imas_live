@@ -4,9 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from imas_live.cms import CmsArticle, SourceUnavailable
 from imas_live.parsing import parse_ticket_page, schedule_performances, japan_datetime, parse_information
+from imas_live.models import Evidence, Performance
 from imas_live.service import ImasLiveService
 from test_calendar import seed
 
@@ -95,6 +97,76 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p.date for p in parse_information(html, 'https://example.test')], ['2026-09-19', '2026-09-20'])
         html = '<dl><dt>開催日 2026.03.27 Update</dt><dd>2026年9月22日(火・祝) 開演18:30<br>2026年9月23日(水・祝) 開演16:30</dd></dl>'
         self.assertEqual([p.date for p in parse_information(html, 'https://example.test')], ['2026-09-22', '2026-09-23'])
+
+    async def test_same_day_matinee_evening_are_stable_and_pc_sp_duplicates_collapse(self):
+        """Exercise official-page parsing, persistence, repeat sync, and LIVE IDs."""
+        source = 'https://idolmaster-official.jp/live_event/test/'
+        html = ('<h3>公演日時</h3>'
+                '<div class="pc">2026年9月8日(火) 開演 13:00</div>'
+                '<div class="sp">2026年9月8日(火) 開演 13:00</div>'
+                '<div>2026年9月8日(火) 開演 18:00</div>')
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory), {'display_timezone': 'Asia/Shanghai', 'freshness_hours': 48})
+            article = CmsArticle('double-show', 'TEST LIVE', source, ['SIDEM'], None, 'Hall', None, {})
+            service.db.upsert_event({'id': article.cms_id, 'title': article.title, 'url': source,
+                                     'brands': article.brands, 'event_display': None, 'venue': 'Hall'})
+            service.client.fetch_html = AsyncMock(return_value=html)
+            self.assertTrue(await service._refresh_article(article))
+            self.assertFalse(await service._refresh_article(article))
+            rows, _ = service.db.calendar_rows()
+            rows = [row for row in rows if row['event_id'] == article.cms_id]
+            self.assertEqual({row['session_label'] for row in rows}, {'开演 13:00 JST', '开演 18:00 JST'})
+            self.assertEqual(len({row['id'] for row in rows}), 2)
+            with service.db._connect() as db:
+                db.execute("UPDATE sources SET fetched_at='2026-09-08T00:00:00+00:00' WHERE event_id=?", (article.cms_id,))
+            service.set_subscription('live', 'test:GroupMessage:42', True)
+            with service.db._connect() as db:
+                db.execute("UPDATE live_group_subscriptions SET created_at='1970-01-01T00:00:00+00:00'")
+            zone = ZoneInfo('Asia/Shanghai')
+            afternoon = await service.claim_due_live_reminders(datetime(2026, 9, 8, 11, 0, tzinfo=zone))
+            evening = await service.claim_due_live_reminders(datetime(2026, 9, 8, 16, 0, tzinfo=zone))
+            self.assertEqual(len(afternoon), 1)
+            self.assertEqual(len(evening), 1)
+            self.assertNotEqual(afternoon[0]['delivery_key'], evening[0]['delivery_key'])
+            await service.close()
+
+    async def test_one_bad_source_is_recorded_and_does_not_stop_later_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory))
+            for event_id in ('bad', 'good'):
+                service.db.upsert_event({'id': event_id, 'title': 'TEST LIVE',
+                                         'url': f'https://idolmaster-official.jp/live_event/{event_id}/',
+                                         'brands': [], 'event_display': None, 'venue': None})
+            service._fetchable_special_page = lambda _url: True
+            service._refresh_article = AsyncMock(side_effect=[ValueError('stable identity collision'), True])
+            result = await service.sync(full_directory=False)
+            self.assertEqual((result['failed_pages'], result['changed_pages']), (1, 1))
+            with service.db._connect() as db:
+                error = db.execute("SELECT error FROM sources WHERE event_id='bad'").fetchone()['error']
+            self.assertIn('stable identity collision', error)
+            await service.close()
+
+    async def test_ambiguous_stable_key_keeps_the_previous_verified_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory))
+            source = 'https://example.test/ambiguous'
+            service.db.upsert_event({'id': 'ambiguous', 'title': 'TEST LIVE', 'url': source,
+                                     'brands': [], 'event_display': None, 'venue': None})
+            original = Performance('session', '2026-09-08', '开演 13:00 JST', None,
+                                   evidence=Evidence(source, '13:00', 'test'))
+            service.db.save_parsed('ambiguous', source, 'v1', 'test', [], [original], [], [])
+            conflicting = [
+                Performance('session', '2026-09-08', '开演 13:00 JST', None,
+                            evidence=Evidence(source, '13:00', 'test')),
+                Performance('session', '2026-09-08', '开演 18:00 JST', None,
+                            evidence=Evidence(source, '18:00', 'test')),
+            ]
+            with self.assertRaisesRegex(ValueError, '场次稳定身份冲突'):
+                service.db.save_parsed('ambiguous', source, 'v2', 'test', [], conflicting, [], [])
+            rows, _ = service.db.calendar_rows()
+            self.assertEqual([(row['id'], row['session_label']) for row in rows],
+                             [('ambiguous:session', '开演 13:00 JST')])
+            await service.close()
 
     def test_ticketcol_seat_subheading_does_not_hide_sale_method(self):
         html = '<h2>一般販売(先着) 2026.8.21 UPDATE!</h2><h3>受付対象席種</h3><div class="ticketCol"><dl><dt>受付期間</dt><dd>2026年8月30日12:00～9月12日23:59</dd></dl></div>'

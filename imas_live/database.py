@@ -176,6 +176,11 @@ class Database:
                     cast: Iterable[CastAppearance], review_notes: Iterable[str]) -> bool:
         """Store one page atomically. Return true only for a meaningful page change."""
         stamp = now()
+        # Do this before opening the write transaction.  Exact duplicate PC/SP
+        # markup is harmless, but two different rows claiming one stable ID is
+        # ambiguous: do not delete the old verified cache to make room for it.
+        tickets, performances, cast = list(tickets), list(performances), list(cast)
+        performances = self._unique_performances(event_id, source_url, performances)
         with self._connect() as db:
             existing = db.execute("SELECT content_hash FROM sources WHERE event_id=? AND url=?", (event_id, source_url)).fetchone()
             source_baselined = bool(db.execute("SELECT 1 FROM ticket_source_baselines WHERE event_id=? AND source_url=?", (event_id, source_url)).fetchone())
@@ -194,7 +199,6 @@ class Database:
             db.execute("INSERT OR IGNORE INTO revisions(source_url,content_hash,observed_at,summary) VALUES(?,?,?,?)",
                        (source_url, content_hash, stamp, f"{parser} changed"))
             # Replacing records from this exact source keeps IDs stable across deadline changes.
-            tickets, performances, cast = list(tickets), list(performances), list(cast)
             db.execute("DELETE FROM ticket_rounds WHERE event_id=?", (event_id,))
             if performances:
                 db.execute("DELETE FROM performances WHERE event_id=?", (event_id,))
@@ -235,6 +239,35 @@ class Database:
                     db.execute("""INSERT OR IGNORE INTO ticket_new_rounds(round_id,event_id,source_url,observed_at)
                         VALUES(?,?,?,?)""", (round_id, event_id, source_url, stamp))
         return True
+
+    @staticmethod
+    def _unique_performances(event_id: str, source_url: str,
+                             rows: list[Performance]) -> list[Performance]:
+        """Collapse repeated parsed sessions; reject unresolved identities.
+
+        A deterministic key is required for reminder de-duplication.  Keeping
+        the first of identical rows makes desktop/mobile copies safe, while a
+        differing row with the same key is evidence of a parser ambiguity and
+        must leave the previously verified event untouched.
+        """
+        unique: dict[str, Performance] = {}
+        for row in rows:
+            previous = unique.get(row.stable_key)
+            if previous is None:
+                unique[row.stable_key] = row
+                continue
+            if (previous.date, previous.session_label, previous.venue,
+                    previous.status, previous.precision) == (
+                        row.date, row.session_label, row.venue,
+                        row.status, row.precision):
+                continue
+            raise ValueError(
+                "场次稳定身份冲突，已保留旧缓存待核验："
+                f"event={event_id} source={source_url} key={row.stable_key} "
+                f"existing={previous.date}/{previous.session_label!r} "
+                f"incoming={row.date}/{row.session_label!r}"
+            )
+        return list(unique.values())
 
     def source_error(self, event_id: str, url: str, error: str) -> None:
         with self._connect() as db:

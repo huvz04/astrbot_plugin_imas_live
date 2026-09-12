@@ -260,13 +260,22 @@ def schedule_performances(text: str, source_url: str, venue: str | None = None,
             continue
         found.append((match, day_value))
     rows = []
+    seen_sessions: set[str] = set()
     for index, (match, day_value) in enumerate(found):
         tail = normalized[match.end():found[index+1][0].start() if index+1 < len(found) else len(normalized)]
         clocks = re.findall(r'(?:開演\s*[:：]?\s*(\d{1,2}:\d{2})|(\d{1,2}:\d{2})\s*開演)', tail)
         sessions = [a or b for a, b in clocks] or ['']
-        for ordinal, clock in enumerate(sessions):
+        for clock in sessions:
             label = f'开演 {clock} JST' if clock else '演出日（场次待细分）'
-            rows.append(Performance(stable(source_url, day_value, str(ordinal)), day_value, label, venue,
+            # The time, rather than an ordinal local to one date match, is the
+            # stable session identity.  An official page can repeat the same
+            # date in separate blocks (PC/SP markup) and can announce an
+            # afternoon and evening performance on that date.
+            key = stable(source_url, day_value, clock or 'time-unpublished')
+            if key in seen_sessions:
+                continue
+            seen_sessions.add(key)
+            rows.append(Performance(key, day_value, label, venue,
                                     status='directory' if directory else 'announced',
                                     evidence=Evidence(source_url, clean(match.group() + tail)[:300], 'schedule-html')))
     return rows
@@ -305,6 +314,7 @@ def parse_shiny_information(html: str, source_url: str) -> ParsedPage:
     event_year = int(year_match.group(1)) if year_match else None
     current_date: str | None = None
     performance_key: str | None = None
+    seen_performances: set[str] = set()
     for heading in soup.find_all(["h2", "h3", "h4"]):
         text = clean(heading.get_text(" "))
         image = heading.find("img", alt=True)
@@ -313,10 +323,12 @@ def parse_shiny_information(html: str, source_url: str) -> ParsedPage:
         if candidate and ("DAY" in text.upper() or "CAST" in text.upper()):
             current_date = candidate
             performance_key = stable(source_url, candidate, text)
-            parsed.performances.append(Performance(
-                performance_key, candidate, text, None,
-                evidence=Evidence(source_url, text, "shiny-cast-html"),
-            ))
+            if performance_key not in seen_performances:
+                seen_performances.add(performance_key)
+                parsed.performances.append(Performance(
+                    performance_key, candidate, text, None,
+                    evidence=Evidence(source_url, text, "shiny-cast-html"),
+                ))
         if not current_date:
             continue
         block = heading.find_next_sibling("div")
@@ -349,6 +361,7 @@ def parse_day_cast(html: str, source_url: str) -> ParsedPage:
     parsed = ParsedPage()
     year_match = YEAR.search(clean(soup.get_text(" ")))
     year = int(year_match.group(1)) if year_match else None
+    seen_performances: set[str] = set()
     for heading in soup.find_all(["h2", "h3", "h4"]):
         heading_text = clean(heading.get_text(" "))
         if "DAY" not in heading_text.upper() or "CAST" not in heading_text.upper():
@@ -357,8 +370,10 @@ def parse_day_cast(html: str, source_url: str) -> ParsedPage:
         if not day:
             continue
         key = stable(source_url, day, heading_text)
-        parsed.performances.append(Performance(key, day, heading_text, None,
-            evidence=Evidence(source_url, heading_text, "day-cast-html")))
+        if key not in seen_performances:
+            seen_performances.add(key)
+            parsed.performances.append(Performance(key, day, heading_text, None,
+                evidence=Evidence(source_url, heading_text, "day-cast-html")))
         chunks: list[str] = []
         for sibling in heading.find_next_siblings():
             if sibling.name in {"h2", "h3", "h4"}:

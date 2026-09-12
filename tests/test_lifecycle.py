@@ -171,24 +171,20 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin.service.ticket_detail.assert_awaited_once_with(2)
         self.assertEqual([response[0] for response in responses], ["chain"])
 
-    async def test_native_groups_expose_admin_children_without_a_plugin_admin_bypass(self):
+    async def test_native_commands_have_no_duplicate_roots_and_keep_admin_filters(self):
         module = plugin_module()
         cls = module.ImasLivePlugin
         entries = module._test_filter.registry
-        groups = {entry.name: entry for entry in entries if entry.kind == "group"}
-        self.assertEqual(set(groups), {"imaslive", "imasticket"})
-        children = {entry.full_name: entry for entry in entries if entry.kind == "sub_command"}
-        self.assertEqual(set(children), {"imaslive next", "imaslive enable", "imaslive disable",
-                                         "imasticket get", "imasticket enable", "imasticket disable"})
-        group_event = Mock()
-        group_event.get_message_str.return_value = "imaslive"
-        self.assertFalse(cls.imaslive_group.custom_filters[0].filter(group_event, {}))
-        group_event.get_message_str.return_value = "imaslive next gk"
-        self.assertTrue(cls.imaslive_group.custom_filters[0].filter(group_event, {}))
+        commands = {entry.full_name: entry for entry in entries}
+        self.assertEqual(len(commands), len(entries), "AstrBot must not receive duplicate command names")
+        self.assertEqual(set(commands), {
+            "imaslive", "imaslive next", "imaslive enable", "imaslive disable",
+            "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
+        })
         for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable"):
-            self.assertEqual(children[name].permissions, ["admin"])
-        self.assertEqual(children["imaslive next"].permissions, [])
-        self.assertEqual(children["imasticket get"].permissions, [])
+            self.assertEqual(commands[name].permissions, ["admin"])
+        self.assertEqual(commands["imaslive next"].permissions, [])
+        self.assertEqual(commands["imasticket get"].permissions, [])
         self.assertFalse(hasattr(cls, "_can_manage_subscription"))
 
         plugin = cls.__new__(cls)
@@ -204,15 +200,15 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(allowed[0][0], "text")
         plugin.service.set_subscription.assert_called_once_with("live", "test:GroupMessage:42", True)
 
-        # Disabling the native child leaves no parameter-dispatch write path.
+        # Disabling the native command leaves no parameter-dispatch write path.
         plugin.service.set_subscription.reset_mock()
-        children["imaslive enable"].enabled = False
+        commands["imaslive enable"].enabled = False
         self.assertEqual(await module._test_filter.dispatch(plugin, "imaslive enable", event, is_admin=True), [])
         plugin.service.set_subscription.assert_not_called()
 
-        # A WebUI-style child rename leaves no old write-capable path.
-        children["imaslive enable"].enabled = True
-        children["imaslive enable"].name = "start"
+        # A WebUI-style rename leaves no old write-capable path.
+        commands["imaslive enable"].enabled = True
+        commands["imaslive enable"].name = "imaslive start"
         self.assertEqual(await module._test_filter.dispatch(plugin, "imaslive enable", event, is_admin=True), [])
         plugin.service.set_subscription.assert_not_called()
         await module._test_filter.dispatch(plugin, "imaslive start", event, is_admin=True)
