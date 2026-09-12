@@ -82,7 +82,8 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS delivery_log (
               dedupe_key TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, state TEXT NOT NULL,
-              payload TEXT NOT NULL, updated_at TEXT NOT NULL
+              payload TEXT NOT NULL, updated_at TEXT NOT NULL,
+              notification_type TEXT NOT NULL DEFAULT 'legacy'
             );
             -- This mapping is separate from CMS IDs so a number does not change
             -- when an event is refreshed, filtered, or eventually removed.
@@ -103,7 +104,29 @@ class Database:
               source_url TEXT NOT NULL, fetched_at TEXT NOT NULL,
               PRIMARY KEY(event_id,image_url), FOREIGN KEY(event_id) REFERENCES events(id)
             );
+            -- A source must be successfully parsed once before its ticket
+            -- rounds are eligible for change detection.  This avoids turning
+            -- gradual coverage of old pages into announcements.
+            CREATE TABLE IF NOT EXISTS ticket_source_baselines (
+              event_id TEXT NOT NULL, source_url TEXT NOT NULL, baselined_at TEXT NOT NULL,
+              PRIMARY KEY(event_id,source_url), FOREIGN KEY(event_id) REFERENCES events(id)
+            );
+            -- Full directory discovery is the only way a first-seen event can
+            -- be treated as genuinely new rather than backlog coverage.
+            CREATE TABLE IF NOT EXISTS ticket_new_event_discoveries (
+              event_id TEXT PRIMARY KEY, discovered_at TEXT NOT NULL,
+              initial_ticket_notice_recorded INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY(event_id) REFERENCES events(id)
+            );
+            -- Pending, verified additions are intentionally independent of
+            -- deadline reminders and are claimed per subscribed group later.
+            CREATE TABLE IF NOT EXISTS ticket_new_rounds (
+              round_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, source_url TEXT NOT NULL,
+              observed_at TEXT NOT NULL, FOREIGN KEY(event_id) REFERENCES events(id)
+            );
             """)
+            if not any(row['name'] == 'notification_type' for row in db.execute('PRAGMA table_info(delivery_log)')):
+                db.execute("ALTER TABLE delivery_log ADD COLUMN notification_type TEXT NOT NULL DEFAULT 'legacy'")
             # Early local builds keyed sources only by URL; tours share URLs.
             if not any(row['name'] == 'event_id' and row['pk'] for row in db.execute('PRAGMA table_info(sources)')):
                 db.executescript('''ALTER TABLE sources RENAME TO sources_v1;
@@ -127,9 +150,10 @@ class Database:
             for row in missing:
                 db.execute("INSERT INTO event_numbers(event_id,public_number) VALUES(?, COALESCE((SELECT MAX(public_number)+1 FROM event_numbers),1))", (row["id"],))
 
-    def upsert_event(self, item: dict[str, Any]) -> None:
+    def upsert_event(self, item: dict[str, Any], discovered_after_baseline: bool = False) -> bool:
         stamp = now()
         with self._connect() as db:
+            is_new = not bool(db.execute("SELECT 1 FROM events WHERE id=?", (item["id"],)).fetchone())
             db.execute("""INSERT INTO events(id,title,brands_json,official_url,event_display,venue,source_updated,created_at,updated_at)
                 VALUES(:id,:title,:brands,:url,:display,:venue,:updated,:stamp,:stamp)
                 ON CONFLICT(id) DO UPDATE SET title=excluded.title, brands_json=excluded.brands_json,
@@ -142,6 +166,10 @@ class Database:
             # SQLite serializes writers, making MAX()+1 safe in this transaction.
             db.execute("""INSERT OR IGNORE INTO event_numbers(event_id,public_number)
                 VALUES(?, COALESCE((SELECT MAX(public_number) + 1 FROM event_numbers), 1))""", (item["id"],))
+            if is_new and discovered_after_baseline:
+                db.execute("""INSERT OR IGNORE INTO ticket_new_event_discoveries(event_id,discovered_at)
+                    VALUES(?,?)""", (item["id"], stamp))
+        return is_new
 
     def save_parsed(self, event_id: str, source_url: str, content_hash: str, parser: str,
                     tickets: Iterable[TicketRound], performances: Iterable[Performance],
@@ -150,6 +178,8 @@ class Database:
         stamp = now()
         with self._connect() as db:
             existing = db.execute("SELECT content_hash FROM sources WHERE event_id=? AND url=?", (event_id, source_url)).fetchone()
+            source_baselined = bool(db.execute("SELECT 1 FROM ticket_source_baselines WHERE event_id=? AND source_url=?", (event_id, source_url)).fetchone())
+            prior_ticket_ids = {row["id"] for row in db.execute("SELECT id FROM ticket_rounds WHERE event_id=?", (event_id,))}
             changed = not existing or existing["content_hash"] != content_hash
             db.execute("""INSERT INTO sources(url,event_id,content_hash,fetched_at,parser,quality,excerpt,error)
                 VALUES(?,?,?,?,?,'verified','',NULL)
@@ -158,6 +188,8 @@ class Database:
                 (source_url, event_id, content_hash, stamp, parser))
             db.execute('UPDATE sources SET attempted_at=? WHERE event_id=? AND url=?', (stamp, event_id, source_url))
             if not changed:
+                if not source_baselined:
+                    db.execute("INSERT OR IGNORE INTO ticket_source_baselines VALUES(?,?,?)", (event_id, source_url, stamp))
                 return False
             db.execute("INSERT OR IGNORE INTO revisions(source_url,content_hash,observed_at,summary) VALUES(?,?,?,?)",
                        (source_url, content_hash, stamp, f"{parser} changed"))
@@ -186,6 +218,22 @@ class Database:
             for note in review_notes:
                 db.execute("INSERT OR IGNORE INTO review_items(event_id,source_url,note,observed_at) VALUES(?,?,?,?)",
                            (event_id, source_url, note, stamp))
+            current_tickets = {f'{event_id}:{row.stable_key}': row for row in tickets}
+            initial = db.execute("""SELECT initial_ticket_notice_recorded FROM ticket_new_event_discoveries
+                WHERE event_id=?""", (event_id,)).fetchone()
+            if not source_baselined:
+                db.execute("INSERT OR IGNORE INTO ticket_source_baselines VALUES(?,?,?)", (event_id, source_url, stamp))
+                candidate_ids = set(current_tickets) if initial and not initial["initial_ticket_notice_recorded"] else set()
+                if initial and not initial["initial_ticket_notice_recorded"]:
+                    db.execute("""UPDATE ticket_new_event_discoveries SET initial_ticket_notice_recorded=1
+                        WHERE event_id=?""", (event_id,))
+            else:
+                candidate_ids = set(current_tickets) - prior_ticket_ids
+            for round_id in candidate_ids:
+                row = current_tickets[round_id]
+                if row.ticket_scope == "onsite" and row.sale_method == "lottery":
+                    db.execute("""INSERT OR IGNORE INTO ticket_new_rounds(round_id,event_id,source_url,observed_at)
+                        VALUES(?,?,?,?)""", (round_id, event_id, source_url, stamp))
         return True
 
     def source_error(self, event_id: str, url: str, error: str) -> None:
@@ -354,6 +402,15 @@ class Database:
         except ValueError:
             return None
 
+    def subscription_updated_at(self, kind: str, umo: str) -> datetime | None:
+        table = self._subscription_table(kind)
+        with self._connect() as db:
+            row = db.execute(f"SELECT updated_at FROM {table} WHERE umo=? AND enabled=1", (umo,)).fetchone()
+        try:
+            return datetime.fromisoformat(row["updated_at"]) if row else None
+        except ValueError:
+            return None
+
     @staticmethod
     def _subscription_table(kind: str) -> str:
         if kind not in {"live", "ticket"}:
@@ -365,16 +422,18 @@ class Database:
             row = db.execute("SELECT enabled FROM group_switches WHERE umo=?", (umo,)).fetchone()
         return bool(row["enabled"]) if row else default
 
-    def claim_delivery(self, key: str, subscription_id: str, payload: str) -> bool:
+    def claim_delivery(self, key: str, subscription_id: str, payload: str, notification_type: str = "legacy") -> bool:
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute("SELECT state FROM delivery_log WHERE dedupe_key=?", (key,)).fetchone()
             if row and row["state"] in ("sent", "inflight"):
                 return False
             if row:
-                db.execute("UPDATE delivery_log SET state='inflight',payload=?,updated_at=? WHERE dedupe_key=?", (payload, now(), key))
+                db.execute("""UPDATE delivery_log SET state='inflight',payload=?,updated_at=?,notification_type=?
+                    WHERE dedupe_key=?""", (payload, now(), notification_type, key))
             else:
-                db.execute("INSERT INTO delivery_log VALUES(?,?, 'inflight',?,?)", (key,subscription_id,payload,now()))
+                db.execute("""INSERT INTO delivery_log(dedupe_key,subscription_id,state,payload,updated_at,notification_type)
+                    VALUES(?,?, 'inflight',?,?,?)""", (key, subscription_id, payload, now(), notification_type))
             return True
 
     def finish_delivery(self, key: str, success: bool) -> None:
@@ -418,4 +477,18 @@ class Database:
                 WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.quality='verified'
                 GROUP BY t.id
                 ORDER BY t.application_end IS NULL,t.application_end,t.application_start,t.id""").fetchall()
+        return [dict(row) for row in rows]
+
+    def new_ticket_round_rows(self) -> list[dict[str, Any]]:
+        """Return queued verified additions that still exist in the latest page."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT q.round_id,q.observed_at,q.source_url AS announced_source_url,
+                    t.*,e.title,e.brands_json,n.public_number,s.fetched_at AS source_fetched_at,s.quality AS source_quality
+                FROM ticket_new_rounds q
+                JOIN ticket_rounds t ON t.id=q.round_id
+                JOIN events e ON e.id=t.event_id
+                LEFT JOIN event_numbers n ON n.event_id=e.id
+                LEFT JOIN sources s ON s.event_id=q.event_id AND s.url=q.source_url
+                WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.quality='verified'
+                ORDER BY q.observed_at,q.round_id""").fetchall()
         return [dict(row) for row in rows]

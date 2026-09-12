@@ -5,6 +5,7 @@
   "request_timeout_seconds": {"description": "官网请求超时（秒）", "type": "int", "default": 25},
   "freshness_hours": {"description": "超过此时长暂停精确截止提醒（小时）", "type": "int", "default": 12},
   "live_reminder_enabled": {"description": "启用 LIVE 开演提醒", "type": "bool", "default": true},
+  "ticket_new_announcement_enabled": {"description": "启用新增现场抽选公告", "type": "bool", "default": true, "hint": "发送到已执行 /imaslive enable 的群；首次基线和晚开启不会回放历史轮次。"},
   "live_reminder_before_hours": {"description": "LIVE 开演前提醒小时数", "type": "int", "default": 1, "hint": "仅官网给出明确开演时区/时间的场次；按北京时间展示。"},
   "reminder_enabled": {"description": "启用现场抽选截止图片提醒", "type": "bool", "default": true},
   "ticket_reminder_hours": {"description": "抽票截止提醒节点（小时）", "type": "list", "default": [24, 1], "hint": "默认截止前24小时和1小时各一次。"},

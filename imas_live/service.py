@@ -75,13 +75,18 @@ class ImasLiveService:
                     articles = [CmsArticle(row["id"], row["title"], row["official_url"], json.loads(row["brands_json"]), row["event_display"], row["venue"], row["source_updated"], {}) for row in known]
             except SourceUnavailable as exc:
                 self.db.set_meta("last_error", str(exc)); return {"status": "failed", "error": str(exc)}
+            directory_was_complete = self.db.meta("baseline_complete") is not None
             for article in articles:
-                await asyncio.to_thread(self.db.upsert_event, self._event_record(article))
+                # Only a newly discovered entry in a later *complete* directory
+                # can prove that the event itself is newly announced.  Partial
+                # special-page coverage is deliberately not enough.
+                title = article.title.lower()
+                is_live = any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical'))
+                excluded = any(word in title for word in ('museum', 'ホテル', '脱出', '物販', '上映', '発売記念', 'popup'))
+                await asyncio.to_thread(self.db.upsert_event, self._event_record(article),
+                                        full_directory and directory_was_complete and is_live and not excluded)
                 if full_directory:
                     # These are date entries from the official event field, never range expansion.
-                    title = article.title.lower()
-                    is_live = any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical'))
-                    excluded = any(word in title for word in ('museum', 'ホテル', '脱出', '物販', '上映', '発売記念', 'popup'))
                     dates = schedule_performances(article.event_display or '', article.url or f'https://idolmaster-official.jp/live_event#event-{article.cms_id}', article.venue, True) if is_live and not excluded else []
                     await asyncio.to_thread(self.db.save_directory_dates, article.cms_id, dates)
             if full_directory:
@@ -613,6 +618,73 @@ class ImasLiveService:
     async def finish_reminders(self, rows: list[dict[str, Any]], success: bool) -> None:
         for row in rows:
             await asyncio.to_thread(self.db.finish_delivery, row["delivery_key"], success)
+
+    async def claim_new_ticket_announcements(self, current: datetime | None = None) -> list[dict[str, Any]]:
+        """Claim newly verified onsite lottery rounds for LIVE-subscribed groups.
+
+        Candidate rows are written atomically with a successful special-page
+        parse.  The source baseline rules live in the database, while this
+        method only decides whether a still-valid candidate may be delivered.
+        """
+        if not self.config.get("enabled", True) or not self.config.get("ticket_new_announcement_enabled", True):
+            return []
+        zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
+        current = (current or datetime.now(zone)).astimezone(zone)
+        rows = await asyncio.to_thread(self.db.new_ticket_round_rows)
+        with self.db._connect() as db:
+            umos = [str(x["umo"]) for x in db.execute("SELECT umo FROM live_group_subscriptions WHERE enabled=1")]
+        selected: list[dict[str, Any]] = []
+        for row in rows:
+            if not self._brand_allowed(row["brands_json"]) or not self._source_is_fresh(row, current):
+                continue
+            try:
+                observed = datetime.fromisoformat(row["observed_at"])
+            except (TypeError, ValueError):
+                continue
+            start = end = None
+            try:
+                start = datetime.fromisoformat(row["application_start"]) if row.get("application_start") else None
+            except (TypeError, ValueError):
+                pass
+            try:
+                end = datetime.fromisoformat(row["application_end"]) if row.get("application_end") else None
+            except (TypeError, ValueError):
+                pass
+            if end and end.tzinfo and current.astimezone(end.tzinfo) >= end:
+                continue
+            if start and start.tzinfo:
+                if current.astimezone(start.tzinfo) < start:
+                    status, ticket_status = "新抽选已公布／尚未开始", "upcoming"
+                else:
+                    status, ticket_status = "新抽选现已开放", "open"
+            else:
+                status, ticket_status = "新抽选已公布／开始时间待核验", "unknown"
+            times: list[str] = []
+            if start and start.tzinfo:
+                times.append(self._ticket_time(row["application_start"], "开始", zone))
+            else:
+                times.append("开始时间待核验")
+            if end and end.tzinfo:
+                times.append(self._ticket_time(row["application_end"], "截止", zone))
+            else:
+                times.append("截止时间待核验")
+            subtitle = f"{row['name']}｜{status}\n" + "\n".join(times)
+            url = row.get("url") or row.get("source_url") or ""
+            for umo in umos:
+                enabled_since = await asyncio.to_thread(self.db.subscription_updated_at, "live", umo)
+                # A group enabled after discovery deliberately does not receive
+                # accumulated announcements, including after disable/re-enable.
+                if enabled_since and observed < enabled_since:
+                    continue
+                key = f"ticket_new|{umo}|{row['round_id']}"
+                payload = f"#{row.get('public_number') or '?'} {row['title']}｜{row['name']}｜{status}"
+                if await asyncio.to_thread(self.db.claim_delivery, key, umo, payload, "ticket_new"):
+                    selected.append({"delivery_key": key, "notification_type": "ticket_new", "umo": umo,
+                                     "title": row["title"], "brands": json.loads(row["brands_json"]),
+                                     "public_number": row.get("public_number"), "subtitle": subtitle,
+                                     "url": url, "ticket_status": ticket_status, "status_label": status,
+                                     "kind": "ticket", "remaining_minutes": 0})
+        return selected
 
     async def claim_due_live_reminders(self, current: datetime | None = None) -> list[dict[str, Any]]:
         """Claim only precise official start times, one hour before Beijing display time."""

@@ -228,16 +228,18 @@ class CalendarRenderer:
         draw.text((48, height - 30), '状态以官方申请页面为准', font=self.font(18), fill='#657187')
         return self._save(image, 'ticket')
 
-    def render_reminder(self, rows: list[dict[str, Any]], generated_at: datetime) -> Path:
-        cards = [self._card_layout(row, True) for row in rows]
+    def render_reminder(self, rows: list[dict[str, Any]], generated_at: datetime,
+                        heading: str = "IMAS 现场抽票即将截止", footer: str = "请核对官方申请页面",
+                        show_remaining: bool = True) -> Path:
+        cards = [self._card_layout(row, show_remaining) for row in rows]
         height = max(430, 166 + sum(card["height"] + 18 for card in cards) + 55)
         image = Image.new("RGB", (self.width, height), "#fff6f9")
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, 112), fill="#b93863")
-        draw.text((48, 28), "IMAS 现场抽票即将截止", font=self.font(42, True), fill="white")
+        draw.text((48, 28), heading, font=self.font(42, True), fill="white")
         y = 138
         for card in cards:
             self._draw_card(draw, card, y)
             y += card["height"] + 18
-        draw.text((48, height - 45), f"生成于 {generated_at:%Y/%m/%d %H:%M} · 请核对官方申请页面", font=self.font(20), fill="#634b58")
+        draw.text((48, height - 45), f"生成于 {generated_at:%Y/%m/%d %H:%M} · {footer}", font=self.font(20), fill="#634b58")
         return self._save(image, "deadline")
