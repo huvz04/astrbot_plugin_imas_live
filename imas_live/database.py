@@ -417,7 +417,12 @@ class Database:
         with self._connect() as db:
             stamp = now()
             db.execute(f"""INSERT INTO {table}(umo,enabled,created_at,updated_at) VALUES(?,?,?,?)
-                ON CONFLICT(umo) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at""",
+                ON CONFLICT(umo) DO UPDATE SET
+                enabled=excluded.enabled,
+                created_at=CASE WHEN {table}.enabled=0 AND excluded.enabled=1
+                    THEN excluded.created_at ELSE {table}.created_at END,
+                updated_at=CASE WHEN {table}.enabled!=excluded.enabled
+                    THEN excluded.updated_at ELSE {table}.updated_at END""",
                        (umo, int(enabled), stamp, stamp))
 
     def subscription_enabled(self, kind: str, umo: str) -> bool:

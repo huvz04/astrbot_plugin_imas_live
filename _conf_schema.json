@@ -9,6 +9,7 @@
   "live_reminder_before_hours": {"description": "LIVE 开演前提醒小时数", "type": "int", "default": 1, "hint": "仅官网给出明确开演时区/时间的场次；按北京时间展示。"},
   "reminder_enabled": {"description": "启用现场抽选截止图片提醒", "type": "bool", "default": true},
   "ticket_reminder_hours": {"description": "抽票截止提醒节点（小时）", "type": "list", "default": [24, 1], "hint": "默认截止前24小时和1小时各一次。"},
+  "reminder_recovery_minutes": {"description": "抽票提醒失败恢复窗口（分钟）", "type": "int", "default": 20, "hint": "已启用群在节点后的短暂发送/调度失败可重试；不会跨到下一提醒节点或实际截止后补发。"},
   "reminder_before_minutes": {"description": "旧版单次抽票提前分钟数（兼容保留）", "type": "int", "default": 60, "hint": "新版请使用 ticket_reminder_hours；旧值不会覆盖默认的24小时+1小时。"},
   "white_umos": {"description": "旧版抽票 UMO 白名单（仅首次迁移）", "type": "list", "default": [], "hint": "首次启动时仅迁移到抽票订阅；LIVE 不会隐式开启。后续请在群内执行 enable/disable。"},
   "brands": {"description": "展示与提醒的企划代码筛选", "type": "list", "default": [], "hint": "为空表示所有已支持企划；例如 GAKUEN、SIDEM、SHINYCOLORS。"},

@@ -34,7 +34,7 @@
 
 ## WebUI 配置
 
-`/imaslive enable|disable` 与 `/imasticket enable|disable` 是 AstrBot 原生管理员命令，权限由 AstrBot 的管理员配置和指令管理统一决定；插件不维护 `admin_ids`，也不把消息平台的群管理员自动当作 AstrBot 管理员。普通用户仍可使用 LIVE、月份、`next`、抽票查询和 `get`。AstrBot 4.27.3 的指令组会强制把裸组名渲染为帮助，不能同时承载 `/imaslive` 这类默认查询；为了保留既有语法并消除重复注册告警，插件将 `imaslive`、`imaslive next`、`imaslive enable` 等注册为独立的原生命令。它们可在 WebUI 的“指令管理”中分别查看、启停或重命名。私聊不会设置订阅。`/imaslive enable` 同时控制 LIVE 开演前一小时提醒和新增现场抽选公告；`/imasticket enable` 只控制抽票截止前 24 小时与 1 小时提醒。两种订阅分别按完整 UMO 保存，互不影响。
+`/imaslive enable|disable` 与 `/imasticket enable|disable` 是 AstrBot 原生管理员命令，权限由 AstrBot 的管理员配置和指令管理统一决定；插件不维护 `admin_ids`，也不把消息平台的群管理员自动当作 AstrBot 管理员。普通用户仍可使用 LIVE、月份、`next`、抽票查询和 `get`。AstrBot 4.27.3 的指令组会强制把裸组名渲染为帮助，不能同时承载 `/imaslive` 这类默认查询；为了保留既有语法并消除重复注册告警，插件将 `imaslive`、`imaslive next`、`imaslive enable` 等注册为独立的原生命令。它们可在 WebUI 的“指令管理”中分别查看、启停或重命名。私聊不会设置订阅。`/imaslive enable` 同时控制 LIVE 开演前一小时提醒和新增现场抽选公告；`/imasticket enable` 只控制抽票截止前 24 小时与 1 小时提醒。两种订阅分别按完整 UMO 保存，互不影响。已订阅群在节点后短暂的发送或调度故障会在默认 20 分钟恢复窗口内重试；不会跨到下一节点、不会在截止后补发，重新开启订阅也不会回放旧提醒。
 
 | 配置 | 默认值 | 作用 |
 |---|---:|---|

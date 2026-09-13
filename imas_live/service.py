@@ -171,6 +171,49 @@ class ImasLiveService:
                     await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
         return {"refreshed": refreshed, "failed": failed}
 
+    async def refresh_due_ticket_sources(self, current: datetime | None = None) -> dict[str, int]:
+        """Recheck stale official sources that can affect an upcoming alert."""
+        zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
+        current = (current or datetime.now(zone)).astimezone(zone)
+        try:
+            nodes = [max(1, int(value)) for value in self.config.get("ticket_reminder_hours", [24, 1])]
+        except (TypeError, ValueError):
+            nodes = [24, 1]
+        try:
+            recovery_minutes = max(5, int(self.config.get("reminder_recovery_minutes", 20)))
+        except (TypeError, ValueError):
+            recovery_minutes = 20
+        horizon = timedelta(hours=max(nodes), minutes=recovery_minutes)
+        ids: list[str] = []
+        for row in await asyncio.to_thread(self.db.ticket_query_rows):
+            try:
+                start = datetime.fromisoformat(row["application_start"])
+                deadline = datetime.fromisoformat(row["application_end"])
+                now_at_deadline = current.astimezone(deadline.tzinfo)
+            except (TypeError, ValueError):
+                continue
+            if start <= now_at_deadline < deadline and deadline - now_at_deadline <= horizon and not self._source_is_fresh(row, current):
+                ids.append(str(row["event_id"]))
+        if not ids or self._sync_lock.locked():
+            return {"refreshed": 0, "failed": 0}
+        rows = await asyncio.to_thread(self.db.events_by_ids, ids)
+        refreshed = failed = 0
+        async with self._sync_lock:
+            for row in rows:
+                article = CmsArticle(row["id"], row["title"], row["official_url"], json.loads(row["brands_json"]), row["event_display"], row["venue"], row["source_updated"], {})
+                if not self._fetchable_special_page(article.url):
+                    continue
+                try:
+                    await self._refresh_article(article)
+                    refreshed += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.exception("IM@S due-ticket recheck failed: event=%s source=%s", article.cms_id, article.url)
+                    await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+        if refreshed or failed:
+            logger.info("IM@S due-ticket recheck: refreshed=%s failed=%s", refreshed, failed)
+        return {"refreshed": refreshed, "failed": failed}
+
     async def _collect_special(self, article: CmsArticle) -> ParsedPage:
         """Follow actual links under this event only, including HTML meta redirects."""
         root = 'https://idolmaster-official.jp/live_event/' + urlsplit(article.url).path.split('/')[2] + '/'
@@ -565,25 +608,23 @@ class ImasLiveService:
         return {"event": event, "tickets": result, "performances": detail["performances"], "cast": detail["cast"]}
 
     async def claim_due_reminders(self, current: datetime | None = None) -> list[dict[str, Any]]:
-        """Claim the 24h and 1h ticket alerts without backfilling missed nodes."""
+        """Claim ticket alerts with a bounded retry/recovery window."""
         if not self.config.get('enabled', True) or not self.config.get("reminder_enabled", True):
             return []
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
-        last = self.db.meta("last_successful_sync")
-        if not last:
-            return []
-        try:
-            if current.astimezone(timezone.utc) - datetime.fromisoformat(last) > timedelta(hours=int(self.config.get("freshness_hours", 12))):
-                return []
-        except ValueError:
-            return []
         _, rows = await asyncio.to_thread(self.db.calendar_rows)
         nodes = self.config.get("ticket_reminder_hours", [24, 1])
         try:
             nodes = sorted({max(1, int(value)) for value in nodes}, reverse=True)
         except (TypeError, ValueError):
             nodes = [24, 1]
+        try:
+            recovery_minutes = max(5, int(self.config.get("reminder_recovery_minutes", 20)))
+        except (TypeError, ValueError):
+            recovery_minutes = 20
+        with self.db._connect() as db:
+            umos = [str(x["umo"]) for x in db.execute("SELECT umo FROM ticket_group_subscriptions WHERE enabled=1")]
         selected: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -602,14 +643,15 @@ class ImasLiveService:
             if not (started and started.tzinfo and started <= now_at_deadline_zone):
                 continue
             deadline_text, local = self._display_deadline(row["application_end"], zone)
-            with self.db._connect() as db:
-                umos = [str(x["umo"]) for x in db.execute("SELECT umo FROM ticket_group_subscriptions WHERE enabled=1")]
+            eligible_nodes = []
             for node in nodes:
                 due = deadline - timedelta(hours=node)
-                # A fresh subscription must not cause an old 24h alert to be
-                # dumped into the 1h window.  Failed sends remain retryable.
-                if not (due <= now_at_deadline_zone < due + timedelta(minutes=REMINDER_WINDOW_MINUTES)):
-                    continue
+                if due <= now_at_deadline_zone < min(due + timedelta(minutes=recovery_minutes), deadline):
+                    eligible_nodes.append(node)
+            # A long delayed cycle can overlap two nodes; send only the closer
+            # one so a late 24-hour alert never lands beside the one-hour alert.
+            for node in sorted(eligible_nodes)[:1]:
+                due = deadline - timedelta(hours=node)
                 for umo in umos:
                     created = self.db.subscription_created_at("ticket", umo)
                     if created and created.astimezone(deadline.tzinfo) > due:
@@ -621,6 +663,8 @@ class ImasLiveService:
                         selected.append({"delivery_key": key, "umo": umo, "title": row["title"], "brands": json.loads(row["brands_json"]),
                                          "subtitle": f"{row['name']}｜{deadline_text}｜提前{node}小时", "url": row["url"] or row["source_url"],
                                          "remaining_minutes": max(0, int((deadline - now_at_deadline_zone).total_seconds() // 60))})
+        if selected:
+            logger.info("IM@S claimed ticket reminders: count=%s subscriptions=%s", len(selected), len(umos))
         return selected
 
     async def finish_reminders(self, rows: list[dict[str, Any]], success: bool) -> None:

@@ -7,9 +7,10 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from imas_live.service import ImasLiveService
+from imas_live.render import CalendarRenderer
 
 
 class _CustomFilter:
@@ -245,3 +246,35 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(running, (plugin._sync_task, plugin._reminder_task))
             await plugin.terminate()
             self.assertTrue(all(task.cancelled() for task in running))
+
+    async def test_reminder_kinds_are_isolated_and_claimed_rows_are_completed(self):
+        module = plugin_module()
+        plugin = module.ImasLivePlugin.__new__(module.ImasLivePlugin)
+        plugin.config = {}
+        ticket = {"delivery_key": "ticket", "umo": "test:GroupMessage:42", "url": "https://example.test",
+                  "title": "TEST LIVE", "subtitle": "提前1小时", "brands": ["SIDEM"], "remaining_minutes": 60}
+        fresh = {"delivery_key": "new", "umo": "test:GroupMessage:42", "url": "https://example.test",
+                 "title": "TEST LIVE", "subtitle": "新抽选", "brands": ["SIDEM"], "remaining_minutes": 0}
+        plugin.service = Mock()
+        plugin.service.refresh_due_ticket_sources = AsyncMock(return_value={"refreshed": 0, "failed": 0})
+        plugin.service.claim_due_reminders = AsyncMock(return_value=[ticket])
+        plugin.service.claim_due_live_reminders = AsyncMock(side_effect=RuntimeError("live broken"))
+        plugin.service.claim_new_ticket_announcements = AsyncMock(return_value=[fresh])
+        plugin._deliver_reminder_rows = AsyncMock()
+        await plugin._run_reminder_cycle()
+        self.assertEqual(plugin._deliver_reminder_rows.await_args_list,
+                         [call("ticket", [ticket]), call("ticket_new", [fresh])])
+
+        del plugin._deliver_reminder_rows
+        plugin.context = Mock()
+        plugin.context.send_message = AsyncMock(return_value=False)
+        class Chain:
+            def message(self, _text): return self
+            def file_image(self, _path): return self
+        module.MessageChain = Chain
+        with tempfile.TemporaryDirectory() as directory:
+            plugin.renderer = CalendarRenderer(Path(directory))
+            plugin.service.finish_reminders = AsyncMock()
+            await plugin._deliver_reminder_rows("ticket", [ticket])
+        plugin.context.send_message.assert_awaited_once()
+        plugin.service.finish_reminders.assert_awaited_once_with([ticket], False)

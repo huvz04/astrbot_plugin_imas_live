@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
@@ -125,6 +125,23 @@ class CalendarTests(unittest.TestCase):
             self.assertEqual(asyncio.run(service.claim_due_reminders(frozen)), [])
             asyncio.run(service.close())
 
+    def test_ticket_retry_has_a_bounded_recovery_window_and_late_enable_is_not_backfilled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            umo = "aiocqhttp:GroupMessage:42"
+            cfg = {"display_timezone": "Asia/Shanghai", "white_umos": [umo], "freshness_hours": 24,
+                   "reminder_recovery_minutes": 20}
+            service = ImasLiveService(Path(tmp), cfg); seed(service)
+            due = datetime(2026, 9, 7, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+            recovered = asyncio.run(service.claim_due_reminders(due + timedelta(minutes=15)))
+            self.assertEqual(len(recovered), 1)
+            asyncio.run(service.finish_reminders(recovered, False))
+            self.assertEqual(len(asyncio.run(service.claim_due_reminders(due + timedelta(minutes=19)))), 1)
+            self.assertEqual(asyncio.run(service.claim_due_reminders(due + timedelta(minutes=21))), [])
+            service.set_subscription("ticket", umo, False)
+            service.set_subscription("ticket", umo, True)
+            self.assertEqual(asyncio.run(service.claim_due_reminders(due + timedelta(minutes=19))), [])
+            asyncio.run(service.close())
+
     def test_old_single_minute_configuration_does_not_override_dual_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {"display_timezone": "Asia/Shanghai", "white_umos": ["aiocqhttp:GroupMessage:42"], "reminder_before_minutes": 30, "freshness_hours": 24}
@@ -169,6 +186,29 @@ class CalendarTests(unittest.TestCase):
             self.assertEqual(len(first), 1); self.assertIn("提前24小时", first[0]["subtitle"])
             asyncio.run(service.finish_reminders(first, True))
             second = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 8, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            self.assertEqual(len(second), 1); self.assertIn("提前1小时", second[0]["subtitle"])
+            asyncio.run(service.close())
+
+    def test_clash_match_real_ticket_deadlines_claim_both_nodes(self):
+        """Regression for the reported CLASH M@TCH!! premium-member round."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = "https://asobiticket2.asobistore.jp/receptions/2ef26712-5a2d-4458-bd90-8ed878126d87"
+            umo = "aiocqhttp:GroupMessage:42"
+            service = ImasLiveService(Path(tmp), {"display_timezone": "Asia/Shanghai", "freshness_hours": 48,
+                                                   "white_umos": [umo]})
+            service.db.upsert_event({"id": "clash-match", "title": "THE IDOLM@STER CINDERELLA GIRLS × MILLION LIVE! CLASH M@TCH!!",
+                                     "brands": ["CINDERELLAGIRLS", "MILLIONLIVE"], "url": source,
+                                     "event_display": None, "venue": None, "updated": None})
+            ticket = TicketRound("premium", "アソビストアプレミアム会員先行", "onsite", "lottery",
+                                 "2026-08-26T12:00+09:00", "2026-09-13T23:59+09:00",
+                                 url=source, evidence=Evidence(source, "official", "test"))
+            service.db.save_parsed("clash-match", source, "v1", "test", [ticket], [], [], [])
+            with service.db._connect() as db:
+                db.execute("UPDATE sources SET fetched_at='2026-09-12T14:00:00+00:00'")
+            first = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 12, 22, 59, tzinfo=ZoneInfo("Asia/Shanghai"))))
+            self.assertEqual(len(first), 1); self.assertIn("提前24小时", first[0]["subtitle"])
+            asyncio.run(service.finish_reminders(first, True))
+            second = asyncio.run(service.claim_due_reminders(datetime(2026, 9, 13, 21, 59, tzinfo=ZoneInfo("Asia/Shanghai"))))
             self.assertEqual(len(second), 1); self.assertIn("提前1小时", second[0]["subtitle"])
             asyncio.run(service.close())
 

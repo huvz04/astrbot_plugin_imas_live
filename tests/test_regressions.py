@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from imas_live.cms import CmsArticle, SourceUnavailable
 from imas_live.parsing import parse_ticket_page, schedule_performances, japan_datetime, parse_information
-from imas_live.models import Evidence, Performance
+from imas_live.models import Evidence, Performance, TicketRound
 from imas_live.service import ImasLiveService
 from test_calendar import seed
 
@@ -166,6 +166,23 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             rows, _ = service.db.calendar_rows()
             self.assertEqual([(row['id'], row['session_label']) for row in rows],
                              [('ambiguous:session', '开演 13:00 JST')])
+            await service.close()
+
+    async def test_due_ticket_worker_rechecks_a_stale_upcoming_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory), {'display_timezone': 'Asia/Shanghai', 'freshness_hours': 1})
+            source = 'https://idolmaster-official.jp/live_event/recheck/'
+            service.db.upsert_event({'id': 'recheck', 'title': 'TEST LIVE', 'url': source,
+                                     'brands': [], 'event_display': None, 'venue': None})
+            ticket = TicketRound('round', '先行', 'onsite', 'lottery', '2026-09-12T12:00+09:00',
+                                 '2026-09-13T23:59+09:00', evidence=Evidence(source, 'official', 'test'))
+            service.db.save_parsed('recheck', source, 'v1', 'test', [ticket], [], [], [])
+            with service.db._connect() as db:
+                db.execute("UPDATE sources SET fetched_at='2026-09-11T00:00:00+00:00'")
+            service._refresh_article = AsyncMock(return_value=False)
+            result = await service.refresh_due_ticket_sources(datetime(2026, 9, 12, 22, 59, tzinfo=ZoneInfo('Asia/Shanghai')))
+            self.assertEqual(result, {'refreshed': 1, 'failed': 0})
+            service._refresh_article.assert_awaited_once()
             await service.close()
 
     def test_ticketcol_seat_subheading_does_not_hide_sale_method(self):

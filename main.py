@@ -87,39 +87,67 @@ class ImasLivePlugin(Star):
         """Deliver retryable cached alerts every five minutes, independently of syncs."""
         while True:
             try:
-                ticket_due = await self.service.claim_due_reminders()
-                live_due = await self.service.claim_due_live_reminders()
-                ticket_new = await self.service.claim_new_ticket_announcements()
-                by_destination: dict[tuple[str, str], list[dict]] = defaultdict(list)
-                for row in ticket_due + live_due:
-                    by_destination[("reminder", row["umo"])].append(row)
-                for row in ticket_new:
-                    by_destination[("ticket_new", row["umo"])].append(row)
-                for (notification_type, umo), rows in by_destination.items():
-                    for offset in range(0, len(rows), 3):
-                        batch = rows[offset:offset+3]
-                        try:
-                            is_new = notification_type == "ticket_new"
-                            image = await asyncio.to_thread(
-                                self.renderer.render_reminder, batch,
-                                datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))),
-                                "IMAS 新增现场抽选" if is_new else "IMAS 现场提醒",
-                                "请核对官方申请页面" if is_new else "请核对官方页面",
-                                not is_new,
-                            )
-                            links = "\n".join(f"官方链接：{url}" for url in dict.fromkeys(row["url"] for row in batch if row["url"]))
-                            message = MessageChain().message(("IM@S 新增现场抽选\n" if is_new else "IM@S 提醒\n") + links).file_image(str(image))
-                            ok = bool(await self.context.send_message(umo, message))
-                        except Exception:
-                            ok = False
-                            logger.exception("IM@S alert image delivery failed")
-                        await self.service.finish_reminders(batch, ok)
+                await self._run_reminder_cycle()
                 await asyncio.sleep(REMINDER_CHECK_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("IM@S deadline cycle failed")
                 await asyncio.sleep(REMINDER_CHECK_SECONDS)
+
+    async def _run_reminder_cycle(self) -> None:
+        """Isolate claim/render/send failures by notification kind.
+
+        A claimed row is always marked sent or failed before another kind is
+        considered; a failed row is retryable in the service's recovery window.
+        """
+        try:
+            await self.service.refresh_due_ticket_sources()
+        except Exception:
+            logger.exception("IM@S due-ticket refresh failed; using cached verified data")
+        for kind, claimant in (
+            ("ticket", self.service.claim_due_reminders),
+            ("live", self.service.claim_due_live_reminders),
+            ("ticket_new", self.service.claim_new_ticket_announcements),
+        ):
+            try:
+                rows = await claimant()
+            except Exception:
+                logger.exception("IM@S %s reminder claim failed", kind)
+                continue
+            await self._deliver_reminder_rows(kind, rows)
+
+    async def _deliver_reminder_rows(self, kind: str, rows: list[dict]) -> None:
+        by_destination: dict[str, list[dict]] = defaultdict(list)
+        for row in rows:
+            by_destination[row["umo"]].append(row)
+        for umo, destination_rows in by_destination.items():
+            for offset in range(0, len(destination_rows), 3):
+                batch = destination_rows[offset:offset + 3]
+                ok = False
+                try:
+                    is_new = kind == "ticket_new"
+                    image = await asyncio.to_thread(
+                        self.renderer.render_reminder, batch,
+                        datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))),
+                        "IMAS 新增现场抽选" if is_new else "IMAS 现场提醒",
+                        "请核对官方申请页面" if is_new else "请核对官方页面",
+                        not is_new,
+                    )
+                    links = "\n".join(f"官方链接：{url}" for url in dict.fromkeys(row["url"] for row in batch if row["url"]))
+                    message = MessageChain().message(("IM@S 新增现场抽选\n" if is_new else "IM@S 提醒\n") + links).file_image(str(image))
+                    ok = bool(await self.context.send_message(umo, message))
+                    if not ok:
+                        logger.warning("IM@S %s reminder send returned false: umo=%s count=%s", kind, umo, len(batch))
+                except Exception:
+                    logger.exception("IM@S %s reminder delivery failed: umo=%s", kind, umo)
+                finally:
+                    try:
+                        await self.service.finish_reminders(batch, ok)
+                    except Exception:
+                        # Inflight rows recover on restart; log the precise kind
+                        # and destination instead of silently blocking all kinds.
+                        logger.exception("IM@S %s reminder completion failed: umo=%s", kind, umo)
 
     @staticmethod
     def _group_umo(event: AstrMessageEvent) -> str | None:
