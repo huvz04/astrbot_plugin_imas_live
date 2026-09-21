@@ -181,8 +181,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(commands), {
             "imaslive", "imaslive next", "imaslive enable", "imaslive disable",
             "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
+            "imasflight", "imasflight plan", "imasflight list",
         })
-        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable"):
+        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable", "imasflight plan"):
             self.assertEqual(commands[name].permissions, ["admin"])
         self.assertEqual(commands["imaslive next"].permissions, [])
         self.assertEqual(commands["imasticket get"].permissions, [])

@@ -26,6 +26,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .imas_live.render import CalendarRenderer
 from .imas_live.service import ImasLiveService
+from .imas_live.flight import FlightPlanner
 
 PLUGIN_NAME = "astrbot_plugin_imas_live"
 REMINDER_CHECK_SECONDS = 5 * 60
@@ -53,6 +54,7 @@ class ImasLivePlugin(Star):
         self.config = config if config is not None else {}
         self.data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
         self.service = ImasLiveService(self.data_dir, self.config)
+        self.flight_planner = FlightPlanner(self.data_dir, self.config)
         self.renderer = CalendarRenderer(self.data_dir / "rendered", str(self.config.get("font_path", "")))
         self._sync_task: asyncio.Task | None = None
         self._reminder_task: asyncio.Task | None = None
@@ -348,6 +350,61 @@ class ImasLivePlugin(Star):
             return
         self.service.set_subscription("ticket", umo, False)
         yield event.plain_result("已关闭本群抽票截止提醒。")
+
+    @filter.command("imasflight")
+    async def imasflight(self, event: AstrMessageEvent, activity_number: int = 0, extra_argument: str = ""):
+        """查看一个活动可选择的已核验场次，并规划上海—东京机票日期。"""
+        if not activity_number or extra_argument:
+            yield event.plain_result("用法：/imasflight <活动编号>。随后由管理员执行 /imasflight plan <活动编号> <场次ID|all> 创建暂停计划。")
+            return
+        detail = await asyncio.to_thread(self.service.db.detail_by_public_number, activity_number)
+        if not detail:
+            yield event.plain_result("没有这个活动编号；请先通过 LIVE 或抽票图确认 #编号。")
+            return
+        sessions = detail.get("performances", [])
+        if not sessions:
+            yield event.plain_result("该活动尚无已核验场次，不能用抽选截止日期生成机票计划。")
+            return
+        lines = [f"#{activity_number} {detail['event']['title']}", "请选择实际参加的场次（不会默认全部参加）："]
+        for row in sessions:
+            lines.append(f"{row['id']}｜{row.get('date')}｜{row.get('session_label') or '开演时间待核验'}｜{row.get('venue') or detail['event'].get('venue') or '场馆待核验'}")
+        lines.append("管理员可显式用 all 选择全部场次；新计划默认暂停，不会查询机票或消费额度。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("imasflight plan")
+    async def imasflight_plan(self, event: AstrMessageEvent, activity_number: int, session_id: str, extra_argument: str = ""):
+        """管理员：按明确选择的场次创建暂停的上海—东京往返机票计划。"""
+        if extra_argument:
+            yield event.plain_result("用法：/imasflight plan <活动编号> <场次ID|all>")
+            return
+        detail = await asyncio.to_thread(self.service.db.detail_by_public_number, activity_number)
+        if not detail:
+            yield event.plain_result("没有这个活动编号。")
+            return
+        selected = [row["id"] for row in detail.get("performances", [])] if session_id.casefold() == "all" else [session_id]
+        try:
+            task = await asyncio.to_thread(self.flight_planner.create_paused_plan, detail, selected,
+                                            str(getattr(event, "unified_msg_origin", "") or ""))
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        yield event.plain_result(
+            f"已创建暂停机票计划 {task['id']}：到达东京候选 {', '.join(task['arrival_dates'])}；"
+            f"返程候选 {', '.join(task['return_dates'])}。需配置 flight_provider 与 flight_target_price_cny，并实现/启用报价源后才能激活；当前不会查询或推送。"
+        )
+
+    @filter.command("imasflight list")
+    async def imasflight_list(self, event: AstrMessageEvent, extra_argument: str = ""):
+        """查看当前会话独立创建的机票计划。"""
+        if extra_argument:
+            yield event.plain_result("用法：/imasflight list")
+            return
+        tasks = await asyncio.to_thread(self.flight_planner.tasks_for, str(getattr(event, "unified_msg_origin", "") or ""))
+        if not tasks:
+            yield event.plain_result("当前会话没有机票计划。机票计划不继承 LIVE 或抽票订阅。")
+            return
+        yield event.plain_result("\n".join(f"{task['id']}｜#{task.get('event_number') or '?'} {task['event_title']}｜{task['status']}｜到达 {','.join(task['arrival_dates'])}／返程 {','.join(task['return_dates'])}" for task in tasks))
 
     async def terminate(self):
         for task in (self._sync_task, self._reminder_task):
