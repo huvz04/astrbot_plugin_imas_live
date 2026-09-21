@@ -35,6 +35,16 @@ BRAND_COMMANDS = {
 REMINDER_WINDOW_MINUTES = 6  # five-minute worker plus modest scheduler jitter
 logger = logging.getLogger(__name__)
 
+# The CMS catalogue has omitted this verified official event.  Keep it as a
+# controlled source, not a guessed URL scan.  It is deliberately not treated
+# as a newly discovered event when added to an existing installation, so old
+# ticket rounds do not trigger a historical group announcement.
+VERIFIED_EVENT_SOURCES = (
+    CmsArticle("IUOAFA", "765 PRODUCTION × 961 PRODUCTION IDOL ULTIMATE ONCE AND FOR ALL",
+               "https://idolmaster-official.jp/live_event/IUOAFA/", ["IDOLMASTER"],
+               "2027年7月24日(土)・25日(日)", "京王アリーナ TOKYO", "2026-09-06", {"controlled_source": True}),
+)
+
 
 class ImasLiveService:
     def __init__(self, data_dir: Path, config: dict[str, Any] | None = None):
@@ -72,6 +82,8 @@ class ImasLiveService:
             try:
                 if full_directory:
                     articles = await self.client.live_articles(int(self.config.get("max_pages", 30)))
+                    known_ids = {article.cms_id for article in articles}
+                    articles.extend(article for article in VERIFIED_EVENT_SOURCES if article.cms_id not in known_ids)
                 else:
                     known = await asyncio.to_thread(self.db.fetchable_events, int(self.config.get("max_special_pages", 12)))
                     articles = [CmsArticle(row["id"], row["title"], row["official_url"], json.loads(row["brands_json"]), row["event_display"], row["venue"], row["source_updated"], {}) for row in known]
@@ -83,10 +95,13 @@ class ImasLiveService:
                 # can prove that the event itself is newly announced.  Partial
                 # special-page coverage is deliberately not enough.
                 title = article.title.lower()
-                is_live = any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical'))
+                is_live = (any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical'))
+                           or str(article.raw.get("event_type", "")).casefold() == "mr_event"
+                           or bool(article.raw.get("controlled_source")))
                 excluded = any(word in title for word in ('museum', 'ホテル', '脱出', '物販', '上映', '発売記念', 'popup'))
                 await asyncio.to_thread(self.db.upsert_event, self._event_record(article),
-                                        full_directory and directory_was_complete and is_live and not excluded)
+                                        full_directory and directory_was_complete and is_live and not excluded
+                                        and not article.raw.get("controlled_source"))
                 if full_directory:
                     # These are date entries from the official event field, never range expansion.
                     dates = schedule_performances(article.event_display or '', article.url or f'https://idolmaster-official.jp/live_event#event-{article.cms_id}', article.venue, True) if is_live and not excluded else []

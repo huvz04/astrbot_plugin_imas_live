@@ -122,7 +122,7 @@ class OfficialCmsClient:
         articles: list[CmsArticle] = []
         total: int | None = None
         for start in range(0, max_pages * page_size, page_size):
-            data = json.dumps({"category": ["LIVE-EVENT"], "article_type": ["url_link", "detail_page"]}, ensure_ascii=False)
+            data = json.dumps({"category": ["LIVE-EVENT"], "article_type": ["url_link", "detail_page", "lp_detail"]}, ensure_ascii=False)
             payload = await self._get("idolmaster/Article/list", {
                 "site": "jp", "ip": "idolmaster", "token": await self.token(), "start": start,
                 "limit": page_size, "data": data,
@@ -162,7 +162,10 @@ class OfficialCmsClient:
     @staticmethod
     def _article(item: dict[str, Any]) -> CmsArticle:
         brands = [str(x.get("code")) for x in item.get("brand", []) if isinstance(x, dict) and x.get("code")]
-        url = item.get("event_url") if item.get("article_type") == "url_link" else None
+        # Some verified event entries expose event_url even when their article
+        # type is not url_link; prefer that official route over synthesising a
+        # CMS detail path.
+        url = item.get("event_url")
         # Routes are confirmed from the site's front-end; a CMS content-detail endpoint is not assumed.
         if not url and item.get("article_type") == "detail_page" and item.get("url_name"):
             url = f"{OFFICIAL}/live_events/{item['url_name']}"

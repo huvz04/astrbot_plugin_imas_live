@@ -41,6 +41,15 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(round_.payment_end, "2026-10-14T23:59+09:00")
         self.assertTrue(round_.url and round_.url.startswith("https://asobiticket2.asobistore.jp/receptions/"))
 
+    def test_iuoafa_ticket_details_are_aggregated_inside_one_reception(self):
+        result = parse_ticket_page(fixture("iuoafa.html"), "https://idolmaster-official.jp/live_event/IUOAFA/")
+        self.assertEqual(len(result.ticket_rounds), 1)
+        round_ = result.ticket_rounds[0]
+        self.assertEqual(round_.name, "アソビストアプレミアム会員先行")
+        self.assertEqual(round_.application_start, "2026-09-06T12:00+09:00")
+        self.assertEqual(round_.application_end, "2026-10-28T23:59+09:00")
+        self.assertIn("12か月会員", round_.eligibility or "")
+
 
     def test_sidem_keeps_first_come_and_resale_distinct(self):
         result = parse_ticket_page(fixture("sidem_ticket.html"), "https://idolmaster-official.jp/live_event/sidem11th/ticket/")

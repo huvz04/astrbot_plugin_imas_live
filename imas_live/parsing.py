@@ -195,7 +195,7 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
     seen: set[str] = set()
     # These are the field-owning units in the three documented page designs.
     # Do not traverse broad page sections: repeated dt labels would overwrite one another.
-    containers = soup.select("section.p-ticket__group, dl.ticketList, dl.c-dl, .ticketCol > dl")
+    containers = soup.select("section.p-ticket__group, details, dl.ticketList, dl.c-dl, .ticketCol > dl")
     # Small Gakuen sections and SideM accordions carry fields in one container.
     for node in containers:
         pairs = _pairs(node)
@@ -225,13 +225,18 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         seen.add(key)
         if period and (start is None or end is None):
             parsed.review_notes.append(f"票务期限无法完整解析：{title}｜{period}")
+        eligibility = _field(pairs, "対象者", "対象会員", "資格")
+        if not eligibility:
+            notes = [clean(item.get_text(" ")) for item in node.select("li")]
+            membership_notes = [note for note in notes if "会員" in note]
+            eligibility = " ".join(membership_notes) or None
         parsed.ticket_rounds.append(TicketRound(
             stable_key=key, name=title, ticket_scope=scope,
             sale_method=_method(title + " " + whole[:300]),
             application_start=start, application_end=end, result_at=result,
             payment_start=pay_start, payment_end=pay_end, url=url,
             seats=_field(pairs, "対象席種", "券種", "チケット料金"),
-            eligibility=_field(pairs, "対象者", "対象会員", "資格"), evidence=evidence,
+            eligibility=eligibility, evidence=evidence,
         ))
     if not parsed.ticket_rounds:
         parsed.review_notes.append("未找到可验证的票务字段；页面已保留为待核验来源。")

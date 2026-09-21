@@ -50,7 +50,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             service.client.fetch_html = AsyncMock(return_value='<h3>公演日時</h3><p>2026年9月12日(土) 17:00開演</p>')
             result = await service.sync()
             self.assertEqual(result['status'], 'ok')
-            self.assertEqual(len(service.db.list_events(limit=100)), 15)
+            self.assertEqual(len(service.db.list_events(limit=100)), 16)  # plus controlled IUOAFA source
             self.assertEqual(service.client.fetch_html.await_count, 1)
             self.assertTrue(service.directory_ready.is_set())
             self.assertTrue(service.db.meta('last_directory_sync'))
@@ -183,6 +183,23 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             result = await service.refresh_due_ticket_sources(datetime(2026, 9, 12, 22, 59, tzinfo=ZoneInfo('Asia/Shanghai')))
             self.assertEqual(result, {'refreshed': 1, 'failed': 0})
             service._refresh_article.assert_awaited_once()
+            await service.close()
+
+    async def test_controlled_iuoafa_source_discovers_three_sessions_and_an_open_ticket(self):
+        html = (Path(__file__).parent / "fixtures" / "iuoafa.html").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory), {"display_timezone": "Asia/Shanghai", "freshness_hours": 48})
+            service.client.live_articles = AsyncMock(return_value=[])
+            service.client.fetch_html = AsyncMock(return_value=html)
+            result = await service.sync()
+            self.assertEqual(result["status"], "ok")
+            detail = service.db.detail("IUOAFA")
+            self.assertEqual([row["date"] for row in detail["performances"]], ["2027-07-24", "2027-07-25", "2027-07-25"])
+            self.assertEqual(len(detail["tickets"]), 1)
+            entries, _, _, _ = await service.ticket_entries(datetime(2026, 9, 21, tzinfo=ZoneInfo("Asia/Shanghai")))
+            self.assertEqual(len(entries), 1)
+            july, _, _, _, _ = await service.calendar_entries(month=7, current=datetime(2026, 9, 21, tzinfo=ZoneInfo("Asia/Shanghai")))
+            self.assertEqual(len(july), 3)
             await service.close()
 
     def test_ticketcol_seat_subheading_does_not_hide_sale_method(self):
