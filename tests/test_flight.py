@@ -22,6 +22,28 @@ def detail():
 
 
 class FlightPlannerTests(unittest.TestCase):
+    def test_user_route_requires_provider_dates_and_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            planner = FlightPlanner(Path(directory), {"flight_providers": ["serpapi"],
+                "flight_serpapi_key": "test-only", "flight_serpapi_monthly_budget": 100})
+            with self.assertRaisesRegex(ValueError, "返程日"):
+                planner.create_subscription("上海", "东京", "2027-07-23", "2027-07-22", "group:1", "user:1")
+            with self.assertRaisesRegex(ValueError, "机场代码"):
+                planner.create_subscription("未知城市", "东京", "2027-07-23", "2027-07-26", "group:1", "user:1")
+            task = planner.create_subscription("上海", "东京", "2027-07-23", "2027-07-26", "group:1", "user:1")
+            self.assertTrue(task["enabled"])
+            self.assertEqual(task["origin_airports"], ["PVG", "SHA"])
+            self.assertEqual(task["destination_airports"], ["NRT", "HND"])
+            self.assertEqual(planner._queries(task), [("PVG,SHA", "NRT,HND", "2027-07-23", "2027-07-26")])
+            self.assertFalse(task["direct_preferred"])
+            with self.assertRaisesRegex(ValueError, "重复"):
+                planner.create_subscription("上海", "东京", "2027-07-23", "2027-07-26", "group:1", "user:1")
+            with self.assertRaisesRegex(ValueError, "自己"):
+                planner.stop_subscription(task["id"], "group:1", "user:2")
+            self.assertTrue(planner.task(task["id"])["enabled"])
+            planner.stop_subscription(task["id"], "group:1", "user:1")
+            self.assertFalse(planner.task(task["id"])["enabled"])
+
     def test_standalone_route_has_explicit_dates_and_starts_paused(self):
         with tempfile.TemporaryDirectory() as directory:
             planner = FlightPlanner(Path(directory))
@@ -83,6 +105,46 @@ def complete_quote(task, *, price=1000, return_stops=0, baggage="unknown"):
 
 
 class FlightMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_self_subscription_alerts_on_any_observed_lowest_price_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            planner = FlightPlanner(Path(directory), {"flight_providers": ["serpapi"],
+                "flight_serpapi_key": "test-only", "flight_serpapi_monthly_budget": 100})
+            task = planner.create_subscription("上海", "东京", "2027-07-23", "2027-07-26", "group:1", "user:1")
+            seen = []
+            async def sender(_umo, _task, quotes):
+                seen.append((quotes[0]["previous_price"], quotes[0]["price"]))
+                return True
+            for price in (1000, 1000, 1100, 900):
+                async def fetch(current, *_): return [complete_quote(current, price=price)]
+                with planner._connect() as db: db.execute("DELETE FROM flight_cache")
+                await planner.check(task["id"], fetch)
+                await planner.deliver(sender)
+            self.assertEqual(seen, [(1000, 1100), (1100, 900)])
+            self.assertEqual(planner.snapshot()["tasks"][0]["baseline_price"], 900)
+            self.assertFalse(planner.due(planner.task(task["id"])))
+            with planner._connect() as db:
+                db.execute("UPDATE flight_progress SET checked=? WHERE task_id=?", (time.time() - 31 * 60, task["id"]))
+            self.assertTrue(planner.due(planner.task(task["id"])))
+
+    async def test_self_subscription_retries_failed_notification_without_repeating_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            planner = FlightPlanner(Path(directory), {"flight_providers": ["serpapi"],
+                "flight_serpapi_key": "test-only", "flight_serpapi_monthly_budget": 100})
+            task = planner.create_subscription("上海", "东京", "2027-07-23", "2027-07-26", "group:1", "user:1")
+            async def baseline(current, *_): return [complete_quote(current, price=1000)]
+            await planner.check(task["id"], baseline)
+            with planner._connect() as db: db.execute("DELETE FROM flight_cache")
+            async def changed(current, *_): return [complete_quote(current, price=1001)]
+            await planner.check(task["id"], changed)
+            sender = AsyncMock(side_effect=[False, True])
+            await planner.deliver(sender)
+            await planner.check(task["id"], changed)
+            await planner.deliver(sender)
+            await planner.deliver(sender)
+            self.assertEqual(sender.await_count, 2)
+            with planner._connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM flight_pending").fetchone()[0], 0)
+
     async def test_serpapi_outbound_token_is_expanded_before_a_quote_exists(self):
         with tempfile.TemporaryDirectory() as directory:
             planner = FlightPlanner(Path(directory), {"flight_serpapi_key": "test-only", "flight_serpapi_monthly_budget": 2})

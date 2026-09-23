@@ -1,8 +1,8 @@
-"""Optional Shanghai--Tokyo fare monitoring bound to verified LIVE sessions.
+"""Optional round-trip fare monitoring and verified LIVE-linked plans.
 
-No request is made until an administrator both configures a provider/key and
-explicitly enables a paused task. Quotes stay separate from LIVE data and are
-rechecked against the selected-performance revision before notification.
+No request is made without a configured provider and positive monthly budget.
+Users may self-subscribe to fixed-date routes; LIVE-linked plans still require
+explicit administrator enablement and event-revision validation.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import time
 import uuid
@@ -22,6 +23,8 @@ from zoneinfo import ZoneInfo
 
 SHANGHAI_AIRPORTS = ("PVG", "SHA")
 TOKYO_AIRPORTS = ("NRT", "HND")
+CITY_AIRPORTS = {"上海": SHANGHAI_AIRPORTS, "东京": TOKYO_AIRPORTS,
+                 "北京": ("PEK", "PKX"), "大阪": ("KIX", "ITM")}
 # Explicit maintained facts only. Unknown venues never receive this route.
 KANTO_VENUES = {"京王アリーナTOKYO", "K-Arena Yokohama", "Kアリーナ横浜", "ぴあアリーナMM",
                 "さいたまスーパーアリーナ", "幕張メッセ", "東京ドーム", "有明アリーナ",
@@ -45,6 +48,17 @@ def _revision(rows: list[dict[str, Any]]) -> str:
 def _safe_link(value: object) -> str:
     parsed = urlparse(str(value or ""))
     return str(value) if parsed.scheme == "https" and parsed.hostname in {"google.com", "www.google.com"} and not parsed.username else ""
+
+
+def _airports(value: str) -> list[str]:
+    """Accept explicit IATA airport codes or a small, unambiguous city alias list."""
+    value = value.strip()
+    if value in CITY_AIRPORTS:
+        return list(CITY_AIRPORTS[value])
+    codes = [part.strip().upper() for part in value.split(",")]
+    if not codes or len(codes) > 4 or any(not re.fullmatch(r"[A-Z]{3}", code) for code in codes):
+        raise FlightError("出发地和目的地请用三字机场代码（如 PVG、NRT），或上海、东京、北京、大阪。")
+    return list(dict.fromkeys(codes))
 
 
 class FlightPlanner:
@@ -76,6 +90,7 @@ class FlightPlanner:
                 CREATE TABLE IF NOT EXISTS flight_sent (task_id TEXT, umo TEXT, revision TEXT, quote_key TEXT, price REAL, PRIMARY KEY(task_id,umo,revision,quote_key));
                 CREATE TABLE IF NOT EXISTS flight_usage (month TEXT PRIMARY KEY, requests INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS flight_progress (task_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, checked REAL NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS flight_baseline (task_id TEXT PRIMARY KEY, price REAL NOT NULL, quote_json TEXT NOT NULL, observed REAL NOT NULL);
             """)
 
     @contextmanager
@@ -146,6 +161,56 @@ class FlightPlanner:
         self._save(task, clear_pending=False)
         return task
 
+    def create_subscription(self, origin: str, destination: str, departure_date: str,
+                            return_date: str, umo: str, owner: str) -> dict[str, Any]:
+        """Self-service monitoring of the cheapest verified round trip on fixed dates."""
+        if not umo or not owner:
+            raise FlightError("无法识别当前会话或订阅者，未创建订阅。")
+        origins, destinations = _airports(origin), _airports(destination)
+        if set(origins) & set(destinations):
+            raise FlightError("出发地和目的地不能相同。")
+        try:
+            departure, returning = date.fromisoformat(departure_date), date.fromisoformat(return_date)
+        except ValueError:
+            raise FlightError("日期格式应为 YYYY-MM-DD。") from None
+        today = datetime.now(timezone.utc).date()
+        if departure <= today or returning <= departure or returning > today + timedelta(days=365):
+            raise FlightError("出发日须晚于今天、返程日须晚于出发日，且均在一年内。")
+        self._check_provider_config()
+        with self._connect() as db:
+            rows = db.execute("SELECT payload_json FROM flight_tasks WHERE json_extract(payload_json,'$.umo')=? AND json_extract(payload_json,'$.owner')=?", (umo, owner)).fetchall()
+        active = [json.loads(row[0]) for row in rows]
+        if any(task.get("enabled") and task.get("monitor_mode") == "change"
+               and task.get("origin_airports") == origins and task.get("destination_airports") == destinations
+               and task.get("outbound_dates") == [departure.isoformat()]
+               and task.get("return_dates") == [returning.isoformat()] for task in active):
+            raise FlightError("这条航线和日期已在当前会话订阅，无需重复创建。")
+        if sum(task.get("enabled") and task.get("monitor_mode") == "change" for task in active) >= 3:
+            raise FlightError("每人在当前会话最多同时监测 3 条航线；请先停止一条旧订阅。")
+        task = {
+            "id": uuid.uuid4().hex[:10], "umo": umo, "owner": owner, "event_id": "",
+            "event_title": f"{origin.upper()} ⇄ {destination.upper()}", "event_number": None,
+            "session_ids": [], "sessions": [], "origin_airports": origins, "destination_airports": destinations,
+            "outbound_dates": [departure.isoformat()],
+            "arrival_dates": [(departure + timedelta(days=offset)).isoformat() for offset in range(-1, 3)],
+            "return_dates": [returning.isoformat()], "currency": "CNY", "adults": 1,
+            "cabin": "economy", "trip": "round_trip", "direct_preferred": False,
+            "baggage_requirement": "none", "target_price": None, "monitor_mode": "change",
+            "providers": self._providers(), "enabled": True, "status": "active",
+            "revision": hashlib.sha256(f"self|{origins}|{destinations}|{departure}|{returning}".encode()).hexdigest()[:20],
+            "updated_at": time.time(),
+        }
+        self._save(task, clear_pending=False)
+        return task
+
+    def stop_subscription(self, task_id: str, umo: str, owner: str) -> dict[str, Any]:
+        task = self.task(task_id)
+        if task.get("monitor_mode") != "change" or task.get("umo") != umo or task.get("owner") != owner:
+            raise FlightError("只能停止自己在当前会话创建的航班订阅。")
+        task["enabled"], task["status"] = False, "paused"
+        self._save(task)
+        return task
+
     def _save(self, task: dict[str, Any], clear_pending: bool = True) -> None:
         task["updated_at"] = time.time()
         with self._connect() as db:
@@ -155,6 +220,7 @@ class FlightPlanner:
     def set_price(self, task_id: str, umo: str, price: int) -> dict[str, Any]:
         task = self.task(task_id)
         if task["umo"] != umo: raise FlightError("当前会话未创建该机票计划。")
+        if task.get("monitor_mode") == "change": raise FlightError("价格变动订阅不使用心理价；可用 unsubscribe 停止。")
         if not 1 <= price <= 1000000: raise FlightError("心理价需为 1 至 1000000 人民币。")
         task["target_price"] = price
         task["enabled"], task["status"] = False, "paused"
@@ -164,6 +230,7 @@ class FlightPlanner:
     def set_baggage(self, task_id: str, umo: str, requirement: str) -> dict[str, Any]:
         task = self.task(task_id)
         if task["umo"] != umo: raise FlightError("当前会话未创建该机票计划。")
+        if task.get("monitor_mode") == "change": raise FlightError("自助价格变动订阅不支持更改行李条件；请停止后重新订阅。")
         if requirement not in {"none", "checked"}: raise FlightError("行李要求只能是 none 或 checked。")
         task["baggage_requirement"] = requirement
         task["enabled"], task["status"] = False, "paused"
@@ -175,9 +242,10 @@ class FlightPlanner:
         if not row: raise KeyError("机票计划不存在。")
         return json.loads(row["payload_json"])
 
-    def tasks_for(self, umo: str) -> list[dict[str, Any]]:
+    def tasks_for(self, umo: str, owner: str | None = None) -> list[dict[str, Any]]:
         with self._connect() as db: rows = db.execute("SELECT payload_json FROM flight_tasks WHERE json_extract(payload_json,'$.umo')=? ORDER BY json_extract(payload_json,'$.updated_at') DESC", (umo,)).fetchall()
-        return [json.loads(row["payload_json"]) for row in rows]
+        tasks = [json.loads(row["payload_json"]) for row in rows]
+        return [task for task in tasks if owner is None or task.get("monitor_mode") != "change" or task.get("owner") == owner]
 
     def all_tasks(self) -> list[dict[str, Any]]:
         # Least recently checked tasks go first when a shared monthly budget is scarce.
@@ -191,15 +259,23 @@ class FlightPlanner:
         task = self.task(task_id)
         if task["umo"] != umo: raise FlightError("当前会话未创建该机票计划。")
         if enabled:
+            if task.get("monitor_mode") == "change":
+                raise FlightError("已停止的自助订阅请使用 subscribe 重新创建。")
+            if task.get("monitor_mode") != "change" and not task.get("target_price"):
+                raise FlightError("请先设置大于 0 的 flight_target_price_cny。")
+            self._check_provider_config()
             task["providers"] = self._providers()
-            if not task.get("target_price"): raise FlightError("请先设置大于 0 的 flight_target_price_cny。")
-            if not task.get("providers"): raise FlightError("请先设置 flight_providers 并填写相应密钥。")
-            if not str(self.config.get("flight_serpapi_key", "")).strip(): raise FlightError("尚未配置 flight_serpapi_key。")
-            if int(self.config.get("flight_serpapi_monthly_budget", 0)) <= 0: raise FlightError("请先设置正数的 flight_serpapi_monthly_budget。")
-            # Aviasales is reserved for a later adapter; it cannot activate monitoring by itself.
-            if "serpapi" not in task["providers"]: raise FlightError("Aviasales 适配器尚未接入；完整往返提醒需要 SerpApi。")
         task["enabled"], task["status"] = bool(enabled), "active" if enabled else "paused"; self._save(task)
         return task
+
+    def _check_provider_config(self) -> None:
+        providers = self._providers()
+        if not providers: raise FlightError("管理员尚未启用 flight_providers。")
+        if "serpapi" not in providers: raise FlightError("Aviasales 适配器尚未接入；完整往返提醒需要 SerpApi。")
+        if not str(self.config.get("flight_serpapi_key", "")).strip(): raise FlightError("管理员尚未配置 flight_serpapi_key。")
+        try: budget = int(self.config.get("flight_serpapi_monthly_budget", 0))
+        except (TypeError, ValueError): budget = 0
+        if budget <= 0: raise FlightError("管理员尚未设置正数的 flight_serpapi_monthly_budget。")
 
     def _spend(self) -> None:
         month = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -308,6 +384,8 @@ class FlightPlanner:
 
     def _queries(self, task: dict[str, Any]) -> list[tuple[str, str, str, str]]:
         origin, destination = ",".join(task["origin_airports"]), ",".join(task["destination_airports"])
+        if task.get("monitor_mode") == "change":
+            return [(origin, destination, task["outbound_dates"][0], task["return_dates"][0])]
         return list(dict.fromkeys((origin, destination, outbound, returning)
                                   for arrival in task["arrival_dates"] for returning in task["return_dates"]
                                   for outbound in ((date.fromisoformat(arrival) - timedelta(days=1)).isoformat(), arrival)))
@@ -324,6 +402,9 @@ class FlightPlanner:
         with self._connect() as db:
             for task in tasks:
                 states, quotes = [], []
+                baseline = db.execute("SELECT price,observed FROM flight_baseline WHERE task_id=?", (task["id"],)).fetchone()
+                task["baseline_price"] = baseline["price"] if baseline else None
+                task["baseline_observed"] = baseline["observed"] if baseline else None
                 for query in self._queries(task):
                     row = db.execute("SELECT checked,error,quotes_json FROM flight_cache WHERE key=?", (self._cache_key(task, query),)).fetchone()
                     if not row: continue
@@ -352,10 +433,16 @@ class FlightPlanner:
             source_at = quote.get("source_at")
             if source_at is not None and not 0 <= time.time() - float(source_at) <= 6 * 3600:
                 return False
-            departure_local = datetime.strptime(str(quote["departure_time"]), "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
-            if departure_local <= datetime.now(ZoneInfo("Asia/Shanghai")):
+            departure_text = str(quote["departure_time"])
+            departure_local = datetime.strptime(departure_text, "%Y-%m-%d %H:%M")
+            if task.get("monitor_mode") == "change":
+                # SerpApi airport timestamps are local but do not carry a timezone.
+                # Fixed-date self-subscriptions start tomorrow or later.
+                if departure_local.date() <= datetime.now(timezone.utc).date(): return False
+            elif departure_local.replace(tzinfo=ZoneInfo("Asia/Shanghai")) <= datetime.now(ZoneInfo("Asia/Shanghai")):
                 return False
-            return (quote.get("provider") == "serpapi" and math.isfinite(price) and 0 < price <= float(task["target_price"])
+            return (quote.get("provider") == "serpapi" and math.isfinite(price) and price > 0
+                    and (task.get("monitor_mode") == "change" or price <= float(task["target_price"]))
                     and 0 <= time.time() - fetched <= 6 * 3600
                     and quote.get("origin") in task["origin_airports"] and quote.get("destination") in task["destination_airports"]
                     and quote.get("return_origin") in task["destination_airports"] and quote.get("return_destination") in task["origin_airports"]
@@ -370,8 +457,18 @@ class FlightPlanner:
 
     def due(self, task: dict[str, Any]) -> bool:
         if not task.get("enabled"): return False
+        if task.get("monitor_mode") == "change" and task["outbound_dates"][0] <= datetime.now(timezone.utc).date().isoformat():
+            return False
         with self._connect() as db: row = db.execute("SELECT checked FROM flight_progress WHERE task_id=?", (task["id"],)).fetchone()
-        return not row or time.time() - row["checked"] >= max(1, int(self.config.get("flight_interval_hours", 12))) * 3600
+        interval = max(30, int(self.config.get("flight_interval_minutes", 30))) * 60
+        return not row or time.time() - row["checked"] >= interval
+
+    def expire_subscription(self, task: dict[str, Any]) -> dict[str, Any]:
+        if (task.get("monitor_mode") == "change" and task.get("enabled")
+                and task["outbound_dates"][0] <= datetime.now(timezone.utc).date().isoformat()):
+            task["enabled"], task["status"] = False, "expired"
+            self._save(task)
+        return task
 
     async def check(self, task_id: str, fetcher: Callable[[dict[str, Any], str, str, str, str], Awaitable[list[dict[str, Any]]]] | None = None) -> list[dict[str, Any]]:
         async with self.lock:
@@ -386,7 +483,7 @@ class FlightPlanner:
             for origin, destination, outbound, returning in picked:
                 cache_key = self._cache_key(task, (origin, destination, outbound, returning))
                 with self._connect() as db: cached = db.execute("SELECT checked,error,quotes_json FROM flight_cache WHERE key=?", (cache_key,)).fetchone()
-                if cached and not cached["error"] and time.time() - cached["checked"] < 3600:
+                if cached and not cached["error"] and time.time() - cached["checked"] < 30 * 60:
                     quotes.extend(json.loads(cached["quotes_json"])); continue
                 try:
                     found = await fetch(task, origin, destination, outbound, returning)
@@ -407,11 +504,32 @@ class FlightPlanner:
             with self._connect() as db:
                 db.execute("INSERT INTO flight_progress VALUES (?,?,?) ON CONFLICT(task_id) DO UPDATE SET cursor=excluded.cursor,checked=excluded.checked", (task_id, (cursor + len(picked)) % len(queries), time.time()))
             valid = {self._quote_key(q): q for q in quotes if self._eligible_quote(task, q)}
+            if task.get("monitor_mode") == "change":
+                self._record_price_change(task, valid)
+                return list(valid.values())
             with self._connect() as db:
                 for key, quote in sorted(valid.items(), key=lambda item: item[1]["price"])[:3]:
                     sent = db.execute("SELECT price FROM flight_sent WHERE task_id=? AND umo=? AND revision=? AND quote_key=?", (task_id, task["umo"], task["revision"], key)).fetchone()
                     if not sent or quote["price"] <= sent["price"] * .95: db.execute("INSERT OR REPLACE INTO flight_pending VALUES (?,?,?,?,?,?)", (task_id, task["umo"], task["revision"], key, json.dumps(quote, ensure_ascii=False), time.time()))
             return list(valid.values())
+
+    def _record_price_change(self, task: dict[str, Any], valid: dict[str, dict[str, Any]]) -> None:
+        """First successful price is silent; subsequent changes replace pending alerts."""
+        with self._connect() as db:
+            if not valid:
+                db.execute("DELETE FROM flight_pending WHERE task_id=?", (task["id"],))
+                return
+            key, cheapest = min(valid.items(), key=lambda item: (float(item[1]["price"]), item[0]))
+            price = round(float(cheapest["price"]), 2)
+            baseline = db.execute("SELECT price FROM flight_baseline WHERE task_id=?", (task["id"],)).fetchone()
+            if baseline is not None and round(float(baseline["price"]), 2) != price:
+                alert = {**cheapest, "previous_price": round(float(baseline["price"]), 2)}
+                db.execute("DELETE FROM flight_pending WHERE task_id=?", (task["id"],))
+                db.execute("INSERT INTO flight_pending VALUES (?,?,?,?,?,?)", (
+                    task["id"], task["umo"], task["revision"], key,
+                    json.dumps(alert, ensure_ascii=False), time.time()))
+            db.execute("INSERT INTO flight_baseline VALUES (?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET price=excluded.price,quote_json=excluded.quote_json,observed=excluded.observed", (
+                task["id"], price, json.dumps(cheapest, ensure_ascii=False), time.time()))
 
     def revalidate(self, task: dict[str, Any], detail: dict[str, Any] | None) -> dict[str, Any]:
         if not detail:

@@ -22,7 +22,7 @@
   "flight_serpapi_monthly_budget": {"description": "SerpApi 月度请求预算", "type": "int", "default": 0, "hint": "默认 0，禁止任何付费请求；请按账户配额显式设为正数。"},
   "flight_max_queries_per_cycle": {"description": "每轮最多基础日期/机场组合", "type": "int", "default": 1, "hint": "每组合可能产生 1 次去程和最多 flight_max_return_expansions 次返程请求，均计入月度预算。"},
   "flight_max_return_expansions": {"description": "每组最多展开返程候选数", "type": "int", "default": 2, "hint": "每展开一次返程需额外请求；默认最多 2 次。"},
-  "flight_interval_hours": {"description": "同一机票计划检查间隔（小时）", "type": "int", "default": 12, "hint": "同一查询跨群共享缓存；管理员手动 check 仍受预算。"},
+  "flight_interval_minutes": {"description": "同一机票订阅检查间隔（分钟）", "type": "int", "default": 30, "hint": "最低 30 分钟；同一查询共享最多 30 分钟缓存。一次往返查询可能消耗多次 SerpApi 额度，额度耗尽时自动停止请求。"},
   "max_pages": {"description": "单次活动目录最大页数", "type": "int", "default": 30, "hint": "防止上游分页异常；当前官网样本约 15 页。"}
   ,"max_special_pages": {"description": "一次同步最多抓取的官方专题页数", "type": "int", "default": 12, "hint": "单域名串行限速；目录仍会完整保存为候选，后续轮换核验。"}
   ,"ticket_query_refresh_max": {"description": "单次手动抽票查询最多复核的当前开放专题数", "type": "int", "default": 4, "hint": "只复核缓存已知、正在开放但超过新鲜度的现场抽选；不会扩大为全站爬取。"}

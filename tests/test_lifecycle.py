@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 from imas_live.service import ImasLiveService
 from imas_live.render import CalendarRenderer
+from imas_live.flight import FlightPlanner
 
 
 class _CustomFilter:
@@ -133,6 +134,27 @@ def plugin_class():
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_admin_can_subscribe_and_only_owner_can_stop(self):
+        module = plugin_module()
+        plugin = module.ImasLivePlugin.__new__(module.ImasLivePlugin)
+        event = Mock()
+        event.unified_msg_origin = "test:GroupMessage:42"
+        event.get_sender_id.return_value = "user:1"
+        event.plain_result.side_effect = lambda value: value
+        with tempfile.TemporaryDirectory() as directory:
+            plugin.flight_planner = FlightPlanner(Path(directory), {"flight_providers": ["serpapi"],
+                "flight_serpapi_key": "test-only", "flight_serpapi_monthly_budget": 10})
+            response = await module._test_filter.dispatch(plugin,
+                "imasflight subscribe 上海 东京 2027-07-23 2027-07-26", event, is_admin=False)
+            self.assertIn("已订阅", response[0])
+            task = plugin.flight_planner.tasks_for(event.unified_msg_origin, "user:1")[0]
+            event.get_sender_id.return_value = "user:2"
+            denied = await module._test_filter.dispatch(plugin, f"imasflight unsubscribe {task['id']}", event, is_admin=False)
+            self.assertIn("只能停止自己", denied[0])
+            event.get_sender_id.return_value = "user:1"
+            stopped = await module._test_filter.dispatch(plugin, f"imasflight unsubscribe {task['id']}", event, is_admin=False)
+            self.assertIn("已停止", stopped[0])
+
     async def test_month_argument_accepts_one_integer_only(self):
         parser = plugin_module().parse_live_month
         self.assertIsNone(parser(""))
@@ -181,12 +203,14 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(commands), {
             "imaslive", "imaslive next", "imaslive enable", "imaslive disable",
             "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
-            "imasflight", "imasflight plan", "imasflight route", "imasflight list", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage",
+            "imasflight", "imasflight plan", "imasflight route", "imasflight list", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage", "imasflight subscribe", "imasflight unsubscribe",
         })
         for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable", "imasflight plan", "imasflight route", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage"):
             self.assertEqual(commands[name].permissions, ["admin"])
         self.assertEqual(commands["imaslive next"].permissions, [])
         self.assertEqual(commands["imasticket get"].permissions, [])
+        self.assertEqual(commands["imasflight subscribe"].permissions, [])
+        self.assertEqual(commands["imasflight unsubscribe"].permissions, [])
         self.assertFalse(hasattr(cls, "_can_manage_subscription"))
 
         plugin = cls.__new__(cls)

@@ -20,9 +20,12 @@ function show(data) {
     const card = element('article', undefined, 'card');
     card.append(element('h2', `#${task.event_number || '?'} ${task.event_title}`));
     card.append(element('span', task.enabled ? '监测中' : task.status, `pill ${task.enabled ? '' : 'warn'}`));
-    card.append(element('p', `计划 ${task.id} · 目标 ${task.umo} · 心理价 ${task.target_price ? `CNY ${task.target_price}` : '未设置'} · ${task.baggage_requirement === 'checked' ? '必须含已核验托运' : '无托运限制'}`, 'muted'));
-    card.append(element('p', `所选场次：${task.sessions.map(s => `${s.date} ${s.label || ''}`).join('；')}`));
-    card.append(element('p', `抵达东京：${task.arrival_dates.join(' / ')}　返程：${task.return_dates.join(' / ')}`, 'muted'));
+    const isChange = task.monitor_mode === 'change';
+    card.append(element('p', `计划 ${task.id} · 目标 ${task.umo} · ${isChange ? `价格变动提醒 · 当前基线 ${task.baseline_price == null ? '尚未建立' : `CNY ${task.baseline_price}`}` : `心理价 ${task.target_price ? `CNY ${task.target_price}` : '未设置'}`} · ${task.baggage_requirement === 'checked' ? '必须含已核验托运' : '无托运限制'}`, 'muted'));
+    if (!isChange) card.append(element('p', `所选场次：${task.sessions.map(s => `${s.date} ${s.label || ''}`).join('；')}`));
+    card.append(element('p', isChange
+      ? `出发：${task.origin_airports.join('/')} → ${task.destination_airports.join('/')} · ${task.outbound_dates[0]}　返程：${task.return_dates[0]}`
+      : `抵达东京：${task.arrival_dates.join(' / ')}　返程：${task.return_dates.join(' / ')}`, 'muted'));
     if (!task.quotes.length) card.append(element('p', '尚无缓存的完整往返候选；空结果不代表无航班。', 'muted'));
     for (const quote of task.quotes) {
       const row = element('div', undefined, 'quote');

@@ -24,7 +24,8 @@ class FlightRenderer:
         image = Image.new("RGB", (1080, height), "#f2f5f0")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((32, 24, 1048, 190), radius=24, fill="#193d32")
-        heading = f"#{task['event_number']} · 上海 ⇄ 东京机票" if task.get("event_number") else "上海 ⇄ 东京机票"
+        route = " ⇄ ".join(("/".join(task["origin_airports"]), "/".join(task["destination_airports"])))
+        heading = f"#{task['event_number']} · {route}机票" if task.get("event_number") else f"{route}机票"
         draw.text((64, 48), heading, font=font[22], fill="#b8d3bd")
         title = str(task.get("event_title", "IM@S LIVE"))
         if draw.textlength(title, font=font[28]) > 946:
@@ -32,13 +33,19 @@ class FlightRenderer:
                 title = title[:-1]
             title += "…"
         draw.text((64, 82), title, font=font[28], fill="white")
-        draw.text((64, 132), "仅展示已返回去回两段的候选；价格、税费和行李以结果页为准", font=font[18], fill="#dce9df")
+        subtitle = ("最低往返价变动；价格、税费和行李以结果页为准" if task.get("monitor_mode") == "change"
+                    else "仅展示已返回去回两段的候选；价格、税费和行李以结果页为准")
+        draw.text((64, 132), subtitle, font=font[18], fill="#dce9df")
         y = 214
         if not quotes:
             draw.text((64, y + 24), "暂无达到心理价的完整往返报价", font=font[28], fill="#193d32")
         for quote in quotes[:3]:
             draw.rounded_rectangle((32, y, 1048, y + 154), radius=18, fill="white")
-            draw.text((64, y + 18), f"CNY {float(quote['price']):,.0f}", font=font[36], fill="#193d32")
+            displayed_price = (f"CNY {float(quote['price']):,.2f}" if task.get("monitor_mode") == "change"
+                               else f"CNY {float(quote['price']):,.0f}")
+            draw.text((64, y + 18), displayed_price, font=font[36], fill="#193d32")
+            if quote.get("previous_price") is not None:
+                draw.text((360, y + 30), f"原价 CNY {float(quote['previous_price']):,.2f}", font=font[22], fill="#687469")
             draw.text((64, y + 70), f"去程 {quote['origin']} → {quote['destination']} · {quote['departure']} 出发 / {quote['arrival_date']} 抵达", font=font[22], fill="#38493f")
             draw.text((64, y + 106), f"返程 {quote['return_origin']} → {quote['return_destination']} · {quote['return_departure_date']} 离开 · {' / '.join(quote['outbound_flights'] + quote['return_flights'])}", font=font[18], fill="#687469")
             y += 172

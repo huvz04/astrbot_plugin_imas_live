@@ -142,6 +142,7 @@ class ImasLivePlugin(Star):
     async def _run_flight_cycle(self) -> None:
         for task in await asyncio.to_thread(self.flight_planner.all_tasks):
             try:
+                task = await asyncio.to_thread(self.flight_planner.expire_subscription, task)
                 if task["event_id"]:
                     detail = await asyncio.to_thread(self.service.db.detail, task["event_id"])
                     task = await asyncio.to_thread(self.flight_planner.revalidate, task, detail)
@@ -165,7 +166,15 @@ class ImasLivePlugin(Star):
             if not current.get("enabled") or current != task or current["umo"] != umo:
                 return False
             links = "\n".join(dict.fromkeys(item["link"] for item in quotes if item.get("link")))
-            text = "IM@S 上海 ⇄ 东京机票达到心理价。\n" + (links or "来源未提供可安全打开的搜索链接。")
+            if task.get("monitor_mode") == "change":
+                old = quotes[0].get("previous_price")
+                new = quotes[0].get("price")
+                route = f"{'/'.join(task['origin_airports'])} ⇄ {'/'.join(task['destination_airports'])}"
+                text = (f"{route} 最低往返价变化：CNY {old:,.2f} → CNY {new:,.2f}。\n"
+                        if old is not None else f"{route} 航班价格变化。\n")
+            else:
+                text = "IM@S 上海 ⇄ 东京机票达到心理价。\n"
+            text += links or "来源未提供可安全打开的搜索链接。"
             message = MessageChain().file_image(str(image)).message(text)
             return bool(await self.context.send_message(umo, message))
         except Exception:
@@ -443,7 +452,7 @@ class ImasLivePlugin(Star):
     async def imasflight(self, event: AstrMessageEvent, activity_number: int = 0, extra_argument: str = ""):
         """查看一个活动可选择的已核验场次，并规划上海—东京机票日期。"""
         if not activity_number or extra_argument:
-            yield event.plain_result("用法：/imasflight <活动编号>。随后由管理员执行 /imasflight plan <活动编号> <场次ID|all> 创建暂停计划。")
+            yield event.plain_result("自助航线订阅：/imasflight subscribe <出发地> <目的地> <出发日> <返程日>；活动联动：/imasflight <活动编号>。")
             return
         detail = await asyncio.to_thread(self.service.db.detail_by_public_number, activity_number)
         if not detail:
@@ -458,6 +467,46 @@ class ImasLivePlugin(Star):
             lines.append(f"{row['id']}｜{row.get('date')}｜{row.get('session_label') or '开演时间待核验'}｜{row.get('venue') or detail['event'].get('venue') or '场馆待核验'}")
         lines.append("管理员可显式用 all 选择全部场次；新计划默认暂停，不会查询机票或消费额度。")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("imasflight subscribe")
+    async def imasflight_subscribe(self, event: AstrMessageEvent, origin: str, destination: str,
+                                   departure_date: str, return_date: str, extra_argument: str = ""):
+        """Any user may subscribe to their own fixed-date round-trip price changes."""
+        if extra_argument:
+            yield event.plain_result("用法：/imasflight subscribe <出发地> <目的地> <出发日YYYY-MM-DD> <返程日YYYY-MM-DD>")
+            return
+        owner = self._flight_owner(event)
+        try:
+            task = await asyncio.to_thread(self.flight_planner.create_subscription, origin, destination,
+                                           departure_date, return_date,
+                                           str(getattr(event, "unified_msg_origin", "") or ""), owner)
+            yield event.plain_result(
+                f"已订阅航班 {task['id']}：{origin} ⇄ {destination}，{departure_date} 去、{return_date} 回。"
+                "每 30 分钟检查一次最低完整往返价；首次查价仅建立基线，之后涨跌都会提醒。"
+                f"停止：/imasflight unsubscribe {task['id']}。实际查询受管理员配置的月度 API 额度限制。")
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+
+    @filter.command("imasflight unsubscribe")
+    async def imasflight_unsubscribe(self, event: AstrMessageEvent, task_id: str, extra_argument: str = ""):
+        """A subscriber can stop only their own plan in the current conversation."""
+        if extra_argument:
+            yield event.plain_result("用法：/imasflight unsubscribe <订阅ID>")
+            return
+        try:
+            task = await asyncio.to_thread(self.flight_planner.stop_subscription, task_id,
+                                           str(getattr(event, "unified_msg_origin", "") or ""), self._flight_owner(event))
+            yield event.plain_result(f"已停止航班订阅 {task['id']}。")
+        except (KeyError, ValueError) as exc:
+            yield event.plain_result(str(exc))
+
+    @staticmethod
+    def _flight_owner(event: AstrMessageEvent) -> str:
+        get_sender_id = getattr(event, "get_sender_id", None)
+        if callable(get_sender_id):
+            return str(get_sender_id() or "")
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        return str(getattr(sender, "user_id", "") or "")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasflight plan")
@@ -583,13 +632,18 @@ class ImasLivePlugin(Star):
         if extra_argument:
             yield event.plain_result("用法：/imasflight list")
             return
-        tasks = await asyncio.to_thread(self.flight_planner.tasks_for, str(getattr(event, "unified_msg_origin", "") or ""))
+        tasks = await asyncio.to_thread(self.flight_planner.tasks_for, str(getattr(event, "unified_msg_origin", "") or ""), self._flight_owner(event))
         if not tasks:
             yield event.plain_result("当前会话没有机票计划。机票计划不继承 LIVE 或抽票订阅。")
             return
-        yield event.plain_result("\n".join(
-            f"{task['id']}｜{('#' + str(task['event_number']) + ' ') if task.get('event_number') else ''}{task['event_title']}｜"
-            f"{task['status']}｜到达 {','.join(task['arrival_dates'])}／返程 {','.join(task['return_dates'])}" for task in tasks))
+        lines = []
+        for task in tasks:
+            if task.get("monitor_mode") == "change":
+                dates = f"出发 {task['outbound_dates'][0]}／返程 {task['return_dates'][0]}｜价格变动提醒"
+            else:
+                dates = f"到达 {','.join(task['arrival_dates'])}／返程 {','.join(task['return_dates'])}"
+            lines.append(f"{task['id']}｜{('#' + str(task['event_number']) + ' ') if task.get('event_number') else ''}{task['event_title']}｜{task['status']}｜{dates}")
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         for task in (self._sync_task, self._reminder_task, self._flight_task):
