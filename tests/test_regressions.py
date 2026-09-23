@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -144,6 +144,43 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             with service.db._connect() as db:
                 error = db.execute("SELECT error FROM sources WHERE event_id='bad'").fetchone()['error']
             self.assertIn('stable identity collision', error)
+            await service.close()
+
+    async def test_expected_source_failure_is_warning_and_cached_live_remains_queryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory))
+            for event_id in ('bad', 'good'):
+                source = f'https://idolmaster-official.jp/live_event/{event_id}/'
+                service.db.upsert_event({'id': event_id, 'title': 'TEST LIVE', 'url': source,
+                                         'brands': [], 'event_display': None, 'venue': 'Hall'})
+            source = 'https://idolmaster-official.jp/live_event/good/'
+            service.db.save_parsed('good', source, 'verified-v1', 'test', [], [
+                Performance('session', '2026-10-10', '开演 18:00 JST', 'Hall',
+                            evidence=Evidence(source, 'official', 'test'))], [], [])
+            service._refresh_article = AsyncMock(side_effect=[SourceUnavailable('专题未能解析'), True])
+            with self.assertLogs('imas_live.service', level='WARNING') as logs:
+                result = await service.sync(full_directory=False)
+            self.assertEqual((result['failed_pages'], result['changed_pages']), (1, 1))
+            self.assertNotIn('Traceback', '\n'.join(logs.output))
+            rows, *_ = await service.calendar_entries(month=10, current=datetime(2026, 9, 23, tzinfo=ZoneInfo('Asia/Shanghai')))
+            self.assertTrue(any(row['title'] == 'TEST LIVE' for row in rows))
+            with service.db._connect() as db:
+                bad = db.execute("SELECT quality FROM sources WHERE event_id='bad'").fetchone()
+                good = db.execute("SELECT quality FROM sources WHERE event_id='good'").fetchone()
+            self.assertEqual(bad['quality'], 'stale')
+            self.assertEqual(good['quality'], 'verified')
+            await service.close()
+
+    async def test_source_error_recording_failure_does_not_stop_next_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory))
+            for event_id in ('bad', 'good'):
+                service.db.upsert_event({'id': event_id, 'title': 'TEST LIVE',
+                    'url': f'https://idolmaster-official.jp/live_event/{event_id}/', 'brands': []})
+            service._refresh_article = AsyncMock(side_effect=[SourceUnavailable('专题未能解析'), True])
+            with patch.object(service.db, 'source_error', side_effect=RuntimeError('disk error')):
+                result = await service.sync(full_directory=False)
+            self.assertEqual((result['failed_pages'], result['changed_pages']), (1, 1))
             await service.close()
 
     async def test_ambiguous_stable_key_keeps_the_previous_verified_cache(self):

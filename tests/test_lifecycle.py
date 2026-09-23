@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 from imas_live.service import ImasLiveService
 from imas_live.render import CalendarRenderer
-from imas_live.flight import FlightPlanner
+from imas_live.models import Evidence, Performance
 
 
 class _CustomFilter:
@@ -117,7 +117,7 @@ def plugin_module():
     command_filter = _FilterHarness()
     modules['astrbot.api.event'].filter = command_filter
     modules['astrbot.api.star'].Context = object
-    modules['astrbot.api.star'].Star = object
+    modules['astrbot.api.star'].Star = type('StarStub', (), {'__init__': lambda self, context, config=None: None})
     modules['astrbot.core.utils.astrbot_path'].get_astrbot_plugin_data_path = lambda: '.'
     root = Path(__file__).parents[1]
     modules['_live_test'].__path__ = [str(root)]
@@ -134,26 +134,72 @@ def plugin_class():
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_non_admin_can_subscribe_and_only_owner_can_stop(self):
-        module = plugin_module()
-        plugin = module.ImasLivePlugin.__new__(module.ImasLivePlugin)
-        event = Mock()
-        event.unified_msg_origin = "test:GroupMessage:42"
-        event.get_sender_id.return_value = "user:1"
-        event.plain_result.side_effect = lambda value: value
+    async def test_imaslive_still_renders_cached_calendar_after_source_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
-            plugin.flight_planner = FlightPlanner(Path(directory), {"flight_providers": ["serpapi"],
-                "flight_serpapi_key": "test-only", "flight_serpapi_monthly_budget": 10})
-            response = await module._test_filter.dispatch(plugin,
-                "imasflight subscribe 上海 东京 2027-07-23 2027-07-26", event, is_admin=False)
-            self.assertIn("已订阅", response[0])
-            task = plugin.flight_planner.tasks_for(event.unified_msg_origin, "user:1")[0]
-            event.get_sender_id.return_value = "user:2"
-            denied = await module._test_filter.dispatch(plugin, f"imasflight unsubscribe {task['id']}", event, is_admin=False)
-            self.assertIn("只能停止自己", denied[0])
-            event.get_sender_id.return_value = "user:1"
-            stopped = await module._test_filter.dispatch(plugin, f"imasflight unsubscribe {task['id']}", event, is_admin=False)
-            self.assertIn("已停止", stopped[0])
+            module = plugin_module()
+            with patch.object(module, 'get_astrbot_plugin_data_path', return_value=directory):
+                plugin = module.ImasLivePlugin(Mock(), {'enabled': True})
+            source = 'https://idolmaster-official.jp/live_event/cached/'
+            plugin.service.db.upsert_event({'id': 'cached', 'title': 'CACHED LIVE', 'url': source,
+                                            'brands': ['SIDEM'], 'event_display': None, 'venue': 'Hall'})
+            plugin.service.db.save_parsed('cached', source, 'v1', 'test', [], [
+                Performance('day', '2026-10-10', '开演 18:00 JST', 'Hall',
+                            evidence=Evidence(source, 'official', 'test'))], [], [])
+            source_unavailable = module.ImasLiveService.sync.__globals__['SourceUnavailable']
+            plugin.service._refresh_article = AsyncMock(side_effect=source_unavailable('专题未能解析'))
+            with self.assertLogs('_live_test.imas_live.service', level='WARNING'):
+                result = await plugin.service.sync(full_directory=False)
+            self.assertEqual(result['failed_pages'], 1)
+            event = Mock()
+            event.stop_event.return_value = None
+            event.plain_result.side_effect = lambda text: ('text', text)
+            event.chain_result.side_effect = lambda chain: ('chain', chain)
+            async def idle():
+                await asyncio.Event().wait()
+            plugin._sync_loop, plugin._reminder_loop = idle, idle
+            responses = await asyncio.wait_for(module._test_filter.dispatch(plugin, 'imaslive 10', event), timeout=3)
+            self.assertEqual([item[0] for item in responses], ['text', 'chain'])
+            await plugin.terminate()
+
+    async def test_first_directory_failure_returns_status_without_long_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            module = plugin_module()
+            with patch.object(module, 'get_astrbot_plugin_data_path', return_value=directory):
+                plugin = module.ImasLivePlugin(Mock(), {'enabled': True})
+            source_unavailable = module.ImasLiveService.sync.__globals__['SourceUnavailable']
+            plugin.service.client.live_articles = AsyncMock(side_effect=source_unavailable('官网不可用'))
+            async def sync_once():
+                await plugin.service.sync(full_directory=True)
+                await asyncio.Event().wait()
+            async def idle():
+                await asyncio.Event().wait()
+            plugin._sync_loop, plugin._reminder_loop = sync_once, idle
+            event = Mock()
+            event.stop_event.return_value = None
+            event.plain_result.side_effect = lambda text: ('text', text)
+            event.chain_result.side_effect = lambda chain: ('chain', chain)
+            responses = await asyncio.wait_for(module._test_filter.dispatch(plugin, 'imaslive', event), timeout=3)
+            self.assertEqual([item[0] for item in responses], ['text', 'text', 'chain'])
+            self.assertIn('尚未成功', responses[1][1])
+            await plugin.terminate()
+
+    async def test_live_loads_without_flight_modules_or_dependency_and_preserves_old_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / 'astrbot_plugin_imas_live'
+            data.mkdir()
+            legacy = data / 'imas_flight.sqlite3'
+            legacy.write_bytes(b'old-flight-data')
+            with patch.dict(sys.modules, {'_live_test.imas_live.flight': None,
+                                          '_live_test.imas_live.flight_render': None, 'aiohttp': None}):
+                module = plugin_module()
+                with patch.object(module, 'get_astrbot_plugin_data_path', return_value=directory):
+                    context = Mock()
+                    plugin = module.ImasLivePlugin(context, {'enabled': False})
+            self.assertFalse(hasattr(plugin, 'flight_planner'))
+            self.assertFalse(hasattr(plugin, '_flight_task'))
+            context.register_web_api.assert_not_called()
+            self.assertEqual(legacy.read_bytes(), b'old-flight-data')
+            await plugin.service.close()
 
     async def test_month_argument_accepts_one_integer_only(self):
         parser = plugin_module().parse_live_month
@@ -203,14 +249,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(commands), {
             "imaslive", "imaslive next", "imaslive enable", "imaslive disable",
             "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
-            "imasflight", "imasflight plan", "imasflight route", "imasflight list", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage", "imasflight subscribe", "imasflight unsubscribe",
         })
-        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable", "imasflight plan", "imasflight route", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage"):
+        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable"):
             self.assertEqual(commands[name].permissions, ["admin"])
         self.assertEqual(commands["imaslive next"].permissions, [])
         self.assertEqual(commands["imasticket get"].permissions, [])
-        self.assertEqual(commands["imasflight subscribe"].permissions, [])
-        self.assertEqual(commands["imasflight unsubscribe"].permissions, [])
         self.assertFalse(hasattr(cls, "_can_manage_subscription"))
 
         plugin = cls.__new__(cls)
@@ -251,17 +294,15 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             rendered = Path(directory) / 'calendar.png'; rendered.touch()
             plugin.renderer.render_calendar.return_value = [rendered]
             plugin._sync_task = plugin._reminder_task = None
-            plugin._flight_task = None
-            plugin.flight_planner = Mock()
-            plugin.flight_planner.all_tasks.return_value = []
             async def sync():
                 await asyncio.sleep(0)
                 plugin.service.db.set_meta('last_directory_sync', '2026-09-08T00:00:00+00:00')
                 plugin.service.directory_ready.set()
+                plugin.service.directory_attempted.set()
                 await asyncio.Event().wait()
             async def reminders():
                 await asyncio.Event().wait()
-            plugin._sync_loop, plugin._reminder_loop, plugin._flight_loop = sync, reminders, reminders
+            plugin._sync_loop, plugin._reminder_loop = sync, reminders
             event = Mock()
             event.plain_result.side_effect = lambda text: ('text', text)
             event.image_result.side_effect = lambda path: ('image', path)
@@ -269,9 +310,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             responses = await module._test_filter.dispatch(plugin, "imaslive", event)
             self.assertEqual([result[0] for result in responses], ['text', 'chain'])
             self.assertTrue(plugin.service.directory_ready.is_set())
-            running = (plugin._sync_task, plugin._reminder_task, plugin._flight_task)
+            running = (plugin._sync_task, plugin._reminder_task)
             await plugin.initialize()
-            self.assertEqual(running, (plugin._sync_task, plugin._reminder_task, plugin._flight_task))
+            self.assertEqual(running, (plugin._sync_task, plugin._reminder_task))
             await plugin.terminate()
             self.assertTrue(all(task.cancelled() for task in running))
 

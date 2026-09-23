@@ -74,6 +74,7 @@ class ImasLiveService:
         self.client = OfficialCmsClient(float(self.config.get("request_timeout_seconds", 25)))
         self._sync_lock = asyncio.Lock()
         self.directory_ready = asyncio.Event()
+        self.directory_attempted = asyncio.Event()
 
     async def close(self) -> None:
         await self.client.close()
@@ -123,7 +124,10 @@ class ImasLiveService:
                     known = await asyncio.to_thread(self.db.fetchable_events, int(self.config.get("max_special_pages", 12)))
                     articles = [CmsArticle(row["id"], row["title"], row["official_url"], json.loads(row["brands_json"]), row["event_display"], row["venue"], row["source_updated"], {}) for row in known]
             except SourceUnavailable as exc:
-                self.db.set_meta("last_error", str(exc)); return {"status": "failed", "error": str(exc)}
+                self.db.set_meta("last_error", str(exc))
+                if full_directory:
+                    self.directory_attempted.set()
+                return {"status": "failed", "error": str(exc)}
             directory_was_complete = self.db.meta("baseline_complete") is not None
             for article in articles:
                 # Only a newly discovered entry in a later *complete* directory
@@ -144,6 +148,7 @@ class ImasLiveService:
             if full_directory:
                 self.db.set_meta('last_directory_sync', datetime.now(timezone.utc).isoformat(timespec='seconds'))
                 self.directory_ready.set()
+                self.directory_attempted.set()
                 known = await asyncio.to_thread(self.db.fetchable_events, max(1, int(self.config.get('max_special_pages', 12))))
                 articles = [CmsArticle(row['id'], row['title'], row['official_url'], json.loads(row['brands_json']), row['event_display'], row['venue'], row['source_updated'], {}) for row in known]
             changed, failed = 0, 0
@@ -152,13 +157,23 @@ class ImasLiveService:
                     continue
                 try:
                     changed += int(await self._refresh_article(article))
+                except SourceUnavailable as exc:
+                    failed += 1
+                    logger.warning("IM@S source unavailable: event=%s source=%s reason=%s", article.cms_id, article.url, exc)
+                    try:
+                        await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
+                    except Exception:
+                        logger.exception("IM@S failed to record source error: event=%s source=%s", article.cms_id, article.url)
                 except Exception as exc:
                     # One malformed official page (including a database identity
                     # conflict) must not abort the remaining rotating sources.
                     # source_error persists the event and URL for WebUI/log review.
                     failed += 1
                     logger.exception("IM@S source refresh failed: event=%s source=%s", article.cms_id, article.url)
-                    await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
+                    try:
+                        await asyncio.to_thread(self.db.source_error, article.cms_id, article.url, str(exc))
+                    except Exception:
+                        logger.exception("IM@S failed to record source error: event=%s source=%s", article.cms_id, article.url)
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self.db.set_meta("last_successful_sync", stamp)
             with self.db._connect() as db:
@@ -215,10 +230,20 @@ class ImasLiveService:
                 try:
                     await self._refresh_article(article)
                     refreshed += 1
+                except SourceUnavailable as exc:
+                    failed += 1
+                    logger.warning("IM@S on-demand source unavailable: event=%s source=%s reason=%s", article.cms_id, article.url, exc)
+                    try:
+                        await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+                    except Exception:
+                        logger.exception("IM@S failed to record on-demand source error: event=%s", article.cms_id)
                 except Exception as exc:
                     failed += 1
                     logger.exception("IM@S on-demand source refresh failed: event=%s source=%s", article.cms_id, article.url)
-                    await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+                    try:
+                        await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+                    except Exception:
+                        logger.exception("IM@S failed to record on-demand source error: event=%s", article.cms_id)
         return {"refreshed": refreshed, "failed": failed}
 
     async def refresh_due_ticket_sources(self, current: datetime | None = None) -> dict[str, int]:
@@ -256,10 +281,20 @@ class ImasLiveService:
                 try:
                     await self._refresh_article(article)
                     refreshed += 1
+                except SourceUnavailable as exc:
+                    failed += 1
+                    logger.warning("IM@S due-ticket source unavailable: event=%s source=%s reason=%s", article.cms_id, article.url, exc)
+                    try:
+                        await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+                    except Exception:
+                        logger.exception("IM@S failed to record due-ticket source error: event=%s", article.cms_id)
                 except Exception as exc:
                     failed += 1
                     logger.exception("IM@S due-ticket recheck failed: event=%s source=%s", article.cms_id, article.url)
-                    await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+                    try:
+                        await asyncio.to_thread(self.db.source_error, article.cms_id, str(article.url), str(exc))
+                    except Exception:
+                        logger.exception("IM@S failed to record due-ticket source error: event=%s", article.cms_id)
         if refreshed or failed:
             logger.info("IM@S due-ticket recheck: refreshed=%s failed=%s", refreshed, failed)
         return {"refreshed": refreshed, "failed": failed}

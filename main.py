@@ -23,15 +23,9 @@ except ModuleNotFoundError:  # lightweight import fallback for offline unit test
         def __init__(self, text: str): self.text = text
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
-try:
-    from astrbot.api.web import json_response
-except ModuleNotFoundError:  # offline command-registration tests
-    def json_response(value): return value
 
 from .imas_live.render import CalendarRenderer
 from .imas_live.service import ImasLiveService
-from .imas_live.flight import FlightPlanner
-from .imas_live.flight_render import FlightRenderer
 
 PLUGIN_NAME = "astrbot_plugin_imas_live"
 REMINDER_CHECK_SECONDS = 5 * 60
@@ -59,34 +53,10 @@ class ImasLivePlugin(Star):
         self.config = config if config is not None else {}
         self.data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
         self.service = ImasLiveService(self.data_dir, self.config)
-        self.flight_planner = FlightPlanner(self.data_dir, self.config)
         self.renderer = CalendarRenderer(self.data_dir / "rendered", str(self.config.get("font_path", "")))
-        self.flight_renderer = FlightRenderer(self.data_dir / "rendered", str(self.config.get("font_path", "")))
         self._sync_task: asyncio.Task | None = None
         self._reminder_task: asyncio.Task | None = None
-        self._flight_task: asyncio.Task | None = None
         self._last_directory = 0.0
-        if hasattr(context, "register_web_api"):
-            context.register_web_api(f"/{PLUGIN_NAME}/flight/status", self.flight_page_status, ["GET"], "IM@S flight monitor")
-            context.register_web_api(f"/{PLUGIN_NAME}/flight/activities", self.flight_page_activities, ["GET"], "IM@S flight activities")
-
-    async def flight_page_status(self):
-        return json_response(await asyncio.to_thread(self.flight_planner.snapshot))
-
-    async def flight_page_activities(self):
-        performances, _ = await asyncio.to_thread(self.service.db.calendar_rows)
-        today = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
-        events: dict[str, dict] = {}
-        for row in sorted(performances, key=lambda item: (item.get("date") or "", item["id"])):
-            if not row.get("date") or row["date"] < today:
-                continue
-            item = events.setdefault(row["event_id"], {"number": row.get("public_number"),
-                "title": row["title"], "sessions": []})
-            venue = row.get("venue") or row.get("event_venue")
-            item["sessions"].append({"id": row["id"], "date": row["date"],
-                "label": row.get("session_label"), "venue": venue,
-                "tokyo_route_supported": self.flight_planner._venue_supported(venue)})
-        return json_response({"activities": list(events.values())[:100]})
 
     async def initialize(self):
         """Runs both on boot and WebUI install/reload; the global loaded event does not."""
@@ -94,8 +64,6 @@ class ImasLivePlugin(Star):
             self._sync_task = asyncio.create_task(self._sync_loop())
         if self._reminder_task is None or self._reminder_task.done():
             self._reminder_task = asyncio.create_task(self._reminder_loop())
-        if self._flight_task is None or self._flight_task.done():
-            self._flight_task = asyncio.create_task(self._flight_loop())
 
     async def _sync_loop(self) -> None:
         while True:
@@ -126,60 +94,6 @@ class ImasLivePlugin(Star):
             except Exception:
                 logger.exception("IM@S deadline cycle failed")
                 await asyncio.sleep(REMINDER_CHECK_SECONDS)
-
-    async def _flight_loop(self) -> None:
-        """The optional fare worker never touches LIVE reminder subscriptions."""
-        while True:
-            try:
-                await self._run_flight_cycle()
-                await asyncio.sleep(REMINDER_CHECK_SECONDS)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("IM@S flight monitor cycle failed")
-                await asyncio.sleep(REMINDER_CHECK_SECONDS)
-
-    async def _run_flight_cycle(self) -> None:
-        for task in await asyncio.to_thread(self.flight_planner.all_tasks):
-            try:
-                task = await asyncio.to_thread(self.flight_planner.expire_subscription, task)
-                if task["event_id"]:
-                    detail = await asyncio.to_thread(self.service.db.detail, task["event_id"])
-                    task = await asyncio.to_thread(self.flight_planner.revalidate, task, detail)
-                if await asyncio.to_thread(self.flight_planner.due, task):
-                    await self.flight_planner.check(task["id"])
-            except Exception:
-                logger.exception("IM@S flight check failed: task=%s", task.get("id"))
-        await self.flight_planner.deliver(self._send_flight_quotes)
-
-    async def _send_flight_quotes(self, umo: str, task: dict, quotes: list[dict]) -> bool:
-        """Render only the same at-most-three records that delivery will mark sent."""
-        try:
-            current = await asyncio.to_thread(self.flight_planner.task, task["id"])
-            if task["event_id"]:
-                detail = await asyncio.to_thread(self.service.db.detail, task["event_id"])
-                current = await asyncio.to_thread(self.flight_planner.revalidate, current, detail)
-            if not current.get("enabled") or current != task or current["umo"] != umo:
-                return False
-            image = await asyncio.to_thread(self.flight_renderer.render, task, quotes)
-            current = await asyncio.to_thread(self.flight_planner.task, task["id"])
-            if not current.get("enabled") or current != task or current["umo"] != umo:
-                return False
-            links = "\n".join(dict.fromkeys(item["link"] for item in quotes if item.get("link")))
-            if task.get("monitor_mode") == "change":
-                old = quotes[0].get("previous_price")
-                new = quotes[0].get("price")
-                route = f"{'/'.join(task['origin_airports'])} ⇄ {'/'.join(task['destination_airports'])}"
-                text = (f"{route} 最低往返价变化：CNY {old:,.2f} → CNY {new:,.2f}。\n"
-                        if old is not None else f"{route} 航班价格变化。\n")
-            else:
-                text = "IM@S 上海 ⇄ 东京机票达到心理价。\n"
-            text += links or "来源未提供可安全打开的搜索链接。"
-            message = MessageChain().file_image(str(image)).message(text)
-            return bool(await self.context.send_message(umo, message))
-        except Exception:
-            logger.exception("IM@S flight reminder delivery failed: umo=%s", umo)
-            return False
 
     async def _run_reminder_cycle(self) -> None:
         """Isolate claim/render/send failures by notification kind.
@@ -279,9 +193,15 @@ class ImasLivePlugin(Star):
     async def _wait_for_first_directory(self, event: AstrMessageEvent) -> None:
         await self.initialize()
         if not self.service.db.meta('last_directory_sync') and self.config.get('enabled', True):
+            cached, _ = await asyncio.to_thread(self.service.db.calendar_rows)
+            if cached:
+                yield event.plain_result('官网正在同步；先显示已缓存日历。')
+                return
             yield event.plain_result('正在首次同步官网活动，稍候生成日历。')
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.service.directory_ready.wait(), timeout=40)
+                await asyncio.wait_for(self.service.directory_attempted.wait(), timeout=8)
+            if not self.service.directory_ready.is_set():
+                yield event.plain_result('官网首次同步尚未成功；将显示缓存状态，不会误报为空。')
 
     @filter.command("imaslive")
     async def imaslive(self, event: AstrMessageEvent, month_argument: str = "", extra_argument: str = ""):
@@ -448,205 +368,8 @@ class ImasLivePlugin(Star):
         self.service.set_subscription("ticket", umo, False)
         yield event.plain_result("已关闭本群抽票截止提醒。")
 
-    @filter.command("imasflight")
-    async def imasflight(self, event: AstrMessageEvent, activity_number: int = 0, extra_argument: str = ""):
-        """查看一个活动可选择的已核验场次，并规划上海—东京机票日期。"""
-        if not activity_number or extra_argument:
-            yield event.plain_result("自助航线订阅：/imasflight subscribe <出发地> <目的地> <出发日> <返程日>；活动联动：/imasflight <活动编号>。")
-            return
-        detail = await asyncio.to_thread(self.service.db.detail_by_public_number, activity_number)
-        if not detail:
-            yield event.plain_result("没有这个活动编号；请先通过 LIVE 或抽票图确认 #编号。")
-            return
-        sessions = detail.get("performances", [])
-        if not sessions:
-            yield event.plain_result("该活动尚无已核验场次，不能用抽选截止日期生成机票计划。")
-            return
-        lines = [f"#{activity_number} {detail['event']['title']}", "请选择实际参加的场次（不会默认全部参加）："]
-        for row in sessions:
-            lines.append(f"{row['id']}｜{row.get('date')}｜{row.get('session_label') or '开演时间待核验'}｜{row.get('venue') or detail['event'].get('venue') or '场馆待核验'}")
-        lines.append("管理员可显式用 all 选择全部场次；新计划默认暂停，不会查询机票或消费额度。")
-        yield event.plain_result("\n".join(lines))
-
-    @filter.command("imasflight subscribe")
-    async def imasflight_subscribe(self, event: AstrMessageEvent, origin: str, destination: str,
-                                   departure_date: str, return_date: str, extra_argument: str = ""):
-        """Any user may subscribe to their own fixed-date round-trip price changes."""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight subscribe <出发地> <目的地> <出发日YYYY-MM-DD> <返程日YYYY-MM-DD>")
-            return
-        owner = self._flight_owner(event)
-        try:
-            task = await asyncio.to_thread(self.flight_planner.create_subscription, origin, destination,
-                                           departure_date, return_date,
-                                           str(getattr(event, "unified_msg_origin", "") or ""), owner)
-            yield event.plain_result(
-                f"已订阅航班 {task['id']}：{origin} ⇄ {destination}，{departure_date} 去、{return_date} 回。"
-                "每 30 分钟检查一次最低完整往返价；首次查价仅建立基线，之后涨跌都会提醒。"
-                f"停止：/imasflight unsubscribe {task['id']}。实际查询受管理员配置的月度 API 额度限制。")
-        except ValueError as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.command("imasflight unsubscribe")
-    async def imasflight_unsubscribe(self, event: AstrMessageEvent, task_id: str, extra_argument: str = ""):
-        """A subscriber can stop only their own plan in the current conversation."""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight unsubscribe <订阅ID>")
-            return
-        try:
-            task = await asyncio.to_thread(self.flight_planner.stop_subscription, task_id,
-                                           str(getattr(event, "unified_msg_origin", "") or ""), self._flight_owner(event))
-            yield event.plain_result(f"已停止航班订阅 {task['id']}。")
-        except (KeyError, ValueError) as exc:
-            yield event.plain_result(str(exc))
-
-    @staticmethod
-    def _flight_owner(event: AstrMessageEvent) -> str:
-        get_sender_id = getattr(event, "get_sender_id", None)
-        if callable(get_sender_id):
-            return str(get_sender_id() or "")
-        sender = getattr(getattr(event, "message_obj", None), "sender", None)
-        return str(getattr(sender, "user_id", "") or "")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight plan")
-    async def imasflight_plan(self, event: AstrMessageEvent, activity_number: int, session_id: str, extra_argument: str = ""):
-        """管理员：按明确选择的场次创建暂停的上海—东京往返机票计划。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight plan <活动编号> <场次ID|all>")
-            return
-        detail = await asyncio.to_thread(self.service.db.detail_by_public_number, activity_number)
-        if not detail:
-            yield event.plain_result("没有这个活动编号。")
-            return
-        selected = ([row["id"] for row in detail.get("performances", [])] if session_id.casefold() == "all"
-                    else [part.strip() for part in session_id.split(",") if part.strip()])
-        try:
-            task = await asyncio.to_thread(self.flight_planner.create_paused_plan, detail, selected,
-                                            str(getattr(event, "unified_msg_origin", "") or ""))
-        except ValueError as exc:
-            yield event.plain_result(str(exc))
-            return
-        yield event.plain_result(
-            f"已创建暂停机票计划 {task['id']}：到达东京候选 {', '.join(task['arrival_dates'])}；"
-            f"返程候选 {', '.join(task['return_dates'])}。共 {len(self.flight_planner._queries(task))} 个机场/日期组合。"
-            f"管理员先 /imasflight price {task['id']} <人民币心理价>，配置数据源密钥和预算后，再 /imasflight enable {task['id']}。"
-        )
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight route")
-    async def imasflight_route(self, event: AstrMessageEvent, arrival_date: str, return_date: str, extra_argument: str = ""):
-        """管理员：按明确的东京到达日与返程日创建普通暂停监测。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight route <东京到达日YYYY-MM-DD> <东京返程日YYYY-MM-DD>")
-            return
-        try:
-            task = await asyncio.to_thread(self.flight_planner.create_paused_route, arrival_date, return_date,
-                                            str(getattr(event, "unified_msg_origin", "") or ""))
-            yield event.plain_result(f"已创建暂停机票计划 {task['id']}：东京抵达 {arrival_date}，东京返程 {return_date}。请设置心理价并显式启用。")
-        except ValueError as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight price")
-    async def imasflight_price(self, event: AstrMessageEvent, task_id: str, price: int, extra_argument: str = ""):
-        """管理员：为当前会话计划设置往返含税报价的心理价。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight price <计划ID> <人民币心理价>")
-            return
-        try:
-            task = await asyncio.to_thread(self.flight_planner.set_price, task_id, str(getattr(event, "unified_msg_origin", "") or ""), price)
-            yield event.plain_result(f"机票计划 {task['id']} 心理价已设为 CNY {price}；计划保持暂停，需显式启用。")
-        except (KeyError, ValueError) as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight baggage")
-    async def imasflight_baggage(self, event: AstrMessageEvent, task_id: str, requirement: str, extra_argument: str = ""):
-        """管理员：设置是否必须核验含托运行李。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight baggage <计划ID> <none|checked>")
-            return
-        try:
-            task = await asyncio.to_thread(self.flight_planner.set_baggage, task_id, str(getattr(event, "unified_msg_origin", "") or ""), requirement)
-            yield event.plain_result(f"机票计划 {task['id']} 的托运行李要求已设为 {requirement}；计划保持暂停。")
-        except (KeyError, ValueError) as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight enable")
-    async def imasflight_enable(self, event: AstrMessageEvent, task_id: str, extra_argument: str = ""):
-        """管理员：满足配置条件后，显式启用当前会话的机票计划。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight enable <计划ID>")
-            return
-        try:
-            current = await asyncio.to_thread(self.flight_planner.task, task_id)
-            if current["event_id"]:
-                detail = await asyncio.to_thread(self.service.db.detail, current["event_id"])
-                current = await asyncio.to_thread(self.flight_planner.revalidate, current, detail)
-            if current["status"].startswith("paused_event_"):
-                raise ValueError("活动场次或来源已变化；旧计划已暂停，请重新创建计划。")
-            task = await asyncio.to_thread(self.flight_planner.set_enabled, task_id, str(getattr(event, "unified_msg_origin", "") or ""), True)
-            yield event.plain_result(f"已启用机票计划 {task['id']}；仅完整往返且达到 CNY {task['target_price']} 才会独立推送。")
-        except (KeyError, ValueError) as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight disable")
-    async def imasflight_disable(self, event: AstrMessageEvent, task_id: str, extra_argument: str = ""):
-        """管理员：暂停并撤销该会话尚未发送的机票提醒。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight disable <计划ID>")
-            return
-        try:
-            task = await asyncio.to_thread(self.flight_planner.set_enabled, task_id, str(getattr(event, "unified_msg_origin", "") or ""), False)
-            yield event.plain_result(f"已暂停机票计划 {task['id']}；不会再查询或推送。")
-        except (KeyError, ValueError) as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("imasflight check")
-    async def imasflight_check(self, event: AstrMessageEvent, task_id: str, extra_argument: str = ""):
-        """管理员：对已经启用的计划进行一次受预算约束的检查。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight check <计划ID>")
-            return
-        try:
-            task = await asyncio.to_thread(self.flight_planner.task, task_id)
-            if task["umo"] != str(getattr(event, "unified_msg_origin", "") or ""):
-                raise ValueError("当前会话未创建该机票计划。")
-            if task["event_id"]:
-                detail = await asyncio.to_thread(self.service.db.detail, task["event_id"])
-                task = await asyncio.to_thread(self.flight_planner.revalidate, task, detail)
-            if not task.get("enabled"):
-                raise ValueError("计划已暂停；请核对活动来源、场次与配置。")
-            quotes = await self.flight_planner.check(task_id)
-            yield event.plain_result(f"本次找到 {len(quotes)} 条达到心理价的完整往返候选；提醒将按独立去重规则投递。")
-        except (KeyError, ValueError) as exc:
-            yield event.plain_result(str(exc))
-
-    @filter.command("imasflight list")
-    async def imasflight_list(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """查看当前会话独立创建的机票计划。"""
-        if extra_argument:
-            yield event.plain_result("用法：/imasflight list")
-            return
-        tasks = await asyncio.to_thread(self.flight_planner.tasks_for, str(getattr(event, "unified_msg_origin", "") or ""), self._flight_owner(event))
-        if not tasks:
-            yield event.plain_result("当前会话没有机票计划。机票计划不继承 LIVE 或抽票订阅。")
-            return
-        lines = []
-        for task in tasks:
-            if task.get("monitor_mode") == "change":
-                dates = f"出发 {task['outbound_dates'][0]}／返程 {task['return_dates'][0]}｜价格变动提醒"
-            else:
-                dates = f"到达 {','.join(task['arrival_dates'])}／返程 {','.join(task['return_dates'])}"
-            lines.append(f"{task['id']}｜{('#' + str(task['event_number']) + ' ') if task.get('event_number') else ''}{task['event_title']}｜{task['status']}｜{dates}")
-        yield event.plain_result("\n".join(lines))
-
     async def terminate(self):
-        for task in (self._sync_task, self._reminder_task, self._flight_task):
+        for task in (self._sync_task, self._reminder_task):
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
