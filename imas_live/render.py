@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -165,14 +166,21 @@ class CalendarRenderer:
                 pass
         return path
 
+    @staticmethod
+    def _footer_update_time(value: datetime | None) -> str:
+        """Use source time for data cards; never substitute render time for stale data."""
+        if not value or value.tzinfo is None:
+            return "update time --"
+        return f"update time {value.astimezone(ZoneInfo('Asia/Shanghai')):%Y.%m.%d %H:%M}"
+
     def render_calendar(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime,
-                        status: str = "", title: str = "未来30天 LIVE") -> list[Path]:
+                        status: str = "", title: str = "未来30天 LIVE", data_updated_at: datetime | None = None) -> list[Path]:
         # One measured canvas keeps the complete 30-day window in a single image.
         cards = [(entry['display_date'], self._card_layout(entry))
                  for entry in sorted(entries, key=lambda row: row['display_date'])]
         height = max(620, self.header_height + 36 + sum(
             card['height'] + 16 + (46 if i == 0 or cards[i-1][0] != day else 0)
-            for i, (day, card) in enumerate(cards)) + 110)
+            for i, (day, card) in enumerate(cards)) + 64)
         image = Image.new('RGB', (self.width, height), '#f5f7fb')
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, self.header_height), fill='#172033')
@@ -187,23 +195,30 @@ class CalendarRenderer:
         for day, card in cards:
             value = date.fromisoformat(day)
             weekday = '一二三四五六日'[value.weekday()]
-            marker = '今天' if value == start else ''
             if day != last_day:
-                draw.text((48, y), f'{value:%m/%d} 周{weekday}  {marker}', font=self.font(30, True), fill='#263651')
+                date_label = f'{value:%m/%d} 周{weekday}'
+                date_font = self.font(30, True)
+                draw.text((48, y), date_label, font=date_font, fill='#263651')
+                if value == generated_at.astimezone(ZoneInfo('Asia/Shanghai')).date():
+                    tag_font = self.font(20, True)
+                    tag_left = 48 + draw.textlength(date_label, font=date_font) + 18
+                    tag_width = draw.textlength('今天', font=tag_font) + 28
+                    tag_top = y + 4
+                    draw.rounded_rectangle((tag_left, tag_top, tag_left + tag_width, tag_top + 32), radius=16, fill='#D8F5E5')
+                    draw.text((tag_left + 14, self._centered_text_y(tag_top, 32, draw.textbbox((0, 0), '今天', font=tag_font))),
+                              '今天', font=tag_font, fill='#087B3C')
                 y += 46
             last_day = day
             self._draw_card(draw, card, y)
             y += card['height'] + 16
-        for number, line in enumerate(self._wrap(draw, status or '尚未同步', self.font(19), self.width - 96)[:2]):
-            draw.text((48, height - 86 + 27 * number), line, font=self.font(19), fill='#657187')
-        draw.text((48, height - 30), '仅统计已收录信息 · 预告场次以官网为准', font=self.font(18), fill='#657187')
+        draw.text((48, height - 34), self._footer_update_time(data_updated_at), font=self.font(18), fill='#657187')
         return [self._save(image, 'calendar')]
 
     def render_ticket(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime,
-                      status: str = "") -> Path:
+                      status: str = "", data_updated_at: datetime | None = None) -> Path:
         cards = [self._card_layout(entry) for entry in entries]
         header_height = 204
-        height = max(620, header_height + 36 + sum(card['height'] + 18 for card in cards) + 110)
+        height = max(620, header_height + 36 + sum(card['height'] + 18 for card in cards) + 64)
         image = Image.new('RGB', (self.width, height), '#f5f7fb')
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, header_height), fill='#172033')
@@ -223,9 +238,7 @@ class CalendarRenderer:
         for card in cards:
             self._draw_card(draw, card, y)
             y += card['height'] + 18
-        for number, line in enumerate(self._wrap(draw, status or '尚未同步', self.font(19), self.width - 96)[:2]):
-            draw.text((48, height - 86 + 27 * number), line, font=self.font(19), fill='#657187')
-        draw.text((48, height - 30), '状态以官方申请页面为准', font=self.font(18), fill='#657187')
+        draw.text((48, height - 34), self._footer_update_time(data_updated_at), font=self.font(18), fill='#657187')
         return self._save(image, 'ticket')
 
     def render_reminder(self, rows: list[dict[str, Any]], generated_at: datetime,
@@ -241,5 +254,5 @@ class CalendarRenderer:
         for card in cards:
             self._draw_card(draw, card, y)
             y += card["height"] + 18
-        draw.text((48, height - 45), f"生成于 {generated_at:%Y/%m/%d %H:%M} · {footer}", font=self.font(20), fill="#634b58")
+        draw.text((48, height - 45), self._footer_update_time(generated_at), font=self.font(20), fill="#634b58")
         return self._save(image, "deadline")

@@ -430,7 +430,7 @@ class ImasLiveService:
                 session = row["session_label"] or "场次待核验"
                 entries.append({"kind": "performance", "display_date": row["date"], "title": row["title"],
                                 "subtitle": f"{session}｜{venue}", "brands": json.loads(row["brands_json"]), "url": row["source_url"],
-                                "public_number": row.get("public_number")})
+                                "public_number": row.get("public_number"), "source_fetched_at": row.get("source_fetched_at")})
         entries.sort(key=lambda item: (item["display_date"], item["title"], item["subtitle"]))
         return entries, start, end, self._status(current, zone), title
 
@@ -493,7 +493,7 @@ class ImasLiveService:
             entries.append({"kind": "ticket", "title": row["title"], "subtitle": "\n".join(details),
                             "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"],
                             "ticket_status": ticket_status, "status_label": status_label,
-                            "public_number": row.get("public_number"), "sort_time": deadline})
+                            "public_number": row.get("public_number"), "sort_time": deadline, "source_fetched_at": row.get("source_fetched_at")})
         priority = {"urgent": 0, "open": 1}
         entries.sort(key=lambda item: (priority[item["ticket_status"]], item["sort_time"], item["title"], item["subtitle"]))
         status = self._status(current, zone)
@@ -581,6 +581,7 @@ class ImasLiveService:
                 "subtitle": f"{row.get('session_label') or '场次待核验'}｜{time_text}｜{venue}",
                 "brands": json.loads(row["brands_json"]), "url": row.get("source_url") or "",
                 "public_number": row.get("public_number"), "cast": cast, "precise": precise,
+                "source_fetched_at": row.get("source_fetched_at"),
                 "official_url": detail["event"].get("official_url") if detail else row.get("source_url"),
                 "cast_assets": asset_paths}
 
@@ -614,11 +615,11 @@ class ImasLiveService:
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "\n".join(details),
                            "brands": json.loads(event["brands_json"]), "url": row.get("url") or row.get("source_url"),
                            "ticket_status": "open" if status == "正在抽选" else "unknown", "status_label": status,
-                           "public_number": event["public_number"], "sort_time": row.get("application_end") or ""})
+                           "public_number": event["public_number"], "sort_time": row.get("application_end") or "", "source_fetched_at": event.get("source_fetched_at")})
         if not result:
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "尚未公布可核验的现场票务轮次。",
                            "brands": json.loads(event["brands_json"]), "url": event.get("official_url") or "",
-                           "ticket_status": "unknown", "status_label": "尚未公布", "public_number": event["public_number"], "sort_time": ""})
+                           "ticket_status": "unknown", "status_label": "尚未公布", "public_number": event["public_number"], "sort_time": "", "source_fetched_at": event.get("source_fetched_at")})
         result.sort(key=lambda item: item["sort_time"], reverse=True)
         return {"event": event, "tickets": result, "performances": detail["performances"], "cast": detail["cast"]}
 

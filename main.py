@@ -166,6 +166,19 @@ class ImasLivePlugin(Star):
             values.append(f"{item['person_name']}{role}")
         return "出演资料：" + "、".join(values)
 
+    @staticmethod
+    def _data_updated_at(rows: list[dict]) -> datetime | None:
+        """The footer reports only a verified source timestamp, never render time."""
+        values = []
+        for row in rows:
+            try:
+                value = datetime.fromisoformat(str(row.get("source_fetched_at") or ""))
+                if value.tzinfo:
+                    values.append(value)
+            except ValueError:
+                continue
+        return max(values) if values else None
+
     def _image_and_links(self, event: AstrMessageEvent, image: Path, links: list[str], extra_images: list[str] | None = None):
         """One passive response chain keeps the PNG before every clickable URL."""
         if not image.is_file():
@@ -204,7 +217,7 @@ class ImasLivePlugin(Star):
                 yield response
             entries, start, end, status, title = await self.service.calendar_entries(month=month)
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
-            images = await asyncio.to_thread(self.renderer.render_calendar, entries, start.date(), end.date(), now, status, title)
+            images = await asyncio.to_thread(self.renderer.render_calendar, entries, start.date(), end.date(), now, status, title, self._data_updated_at(entries))
             for image in images:
                 yield self._image_and_links(event, image, [])
         except Exception:
@@ -230,7 +243,7 @@ class ImasLivePlugin(Star):
                 yield event.plain_result("没有找到尚未开始的已收录公演。")
                 return
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
-            image = await asyncio.to_thread(self.renderer.render_calendar, [entry], now.date(), now.date(), now, "官网资料以链接为准", "IM@S LIVE! · Next Performance")
+            image = await asyncio.to_thread(self.renderer.render_calendar, [entry], now.date(), now.date(), now, "官网资料以链接为准", "IM@S LIVE! · Next Performance", self._data_updated_at([entry]))
             links = [self._cast_text(entry["cast"]), f"官方活动页：{entry['official_url'] or entry['url']}"]
             yield self._image_and_links(event, image[0], links, entry.get("cast_assets"))
         except Exception:
@@ -284,7 +297,7 @@ class ImasLivePlugin(Star):
             if refresh["failed"]:
                 status += f"｜{refresh['failed']} 个当前开放专题复核失败，未当作开放显示"
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
-            image = await asyncio.to_thread(self.renderer.render_ticket, entries, start.date(), end.date(), now, status)
+            image = await asyncio.to_thread(self.renderer.render_ticket, entries, start.date(), end.date(), now, status, self._data_updated_at(entries))
             links: list[str] = []
             seen: set[str] = set()
             for entry in entries:
