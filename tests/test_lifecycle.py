@@ -181,9 +181,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(commands), {
             "imaslive", "imaslive next", "imaslive enable", "imaslive disable",
             "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
-            "imasflight", "imasflight plan", "imasflight list",
+            "imasflight", "imasflight plan", "imasflight route", "imasflight list", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage",
         })
-        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable", "imasflight plan"):
+        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable", "imasflight plan", "imasflight route", "imasflight enable", "imasflight disable", "imasflight check", "imasflight price", "imasflight baggage"):
             self.assertEqual(commands[name].permissions, ["admin"])
         self.assertEqual(commands["imaslive next"].permissions, [])
         self.assertEqual(commands["imasticket get"].permissions, [])
@@ -227,6 +227,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             rendered = Path(directory) / 'calendar.png'; rendered.touch()
             plugin.renderer.render_calendar.return_value = [rendered]
             plugin._sync_task = plugin._reminder_task = None
+            plugin._flight_task = None
+            plugin.flight_planner = Mock()
+            plugin.flight_planner.all_tasks.return_value = []
             async def sync():
                 await asyncio.sleep(0)
                 plugin.service.db.set_meta('last_directory_sync', '2026-09-08T00:00:00+00:00')
@@ -234,7 +237,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             async def reminders():
                 await asyncio.Event().wait()
-            plugin._sync_loop, plugin._reminder_loop = sync, reminders
+            plugin._sync_loop, plugin._reminder_loop, plugin._flight_loop = sync, reminders, reminders
             event = Mock()
             event.plain_result.side_effect = lambda text: ('text', text)
             event.image_result.side_effect = lambda path: ('image', path)
@@ -242,9 +245,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             responses = await module._test_filter.dispatch(plugin, "imaslive", event)
             self.assertEqual([result[0] for result in responses], ['text', 'chain'])
             self.assertTrue(plugin.service.directory_ready.is_set())
-            running = (plugin._sync_task, plugin._reminder_task)
+            running = (plugin._sync_task, plugin._reminder_task, plugin._flight_task)
             await plugin.initialize()
-            self.assertEqual(running, (plugin._sync_task, plugin._reminder_task))
+            self.assertEqual(running, (plugin._sync_task, plugin._reminder_task, plugin._flight_task))
             await plugin.terminate()
             self.assertTrue(all(task.cancelled() for task in running))
 

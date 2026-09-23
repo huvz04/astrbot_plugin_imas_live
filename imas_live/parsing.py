@@ -87,6 +87,10 @@ def _links(node: Tag, base_url: str) -> list[str]:
 
 
 def _nearest_title(node: Tag) -> str:
+    if node.name == "details":
+        heading = node.find("summary", recursive=False)
+        if heading:
+            return clean(heading.get_text(" "))
     accordion = node.find_parent('dl', class_=lambda value: value in {'accordionList', 'accordion'})
     if accordion:
         heading = accordion.find("dt", recursive=False)
@@ -198,6 +202,10 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
     containers = soup.select("section.p-ticket__group, details, dl.ticketList, dl.c-dl, .ticketCol > dl")
     # Small Gakuen sections and SideM accordions carry fields in one container.
     for node in containers:
+        # Outer accordion/section wrappers can contain several separate
+        # receptions. Their recursive dt/dd traversal would mix deadlines.
+        if node.select_one("details"):
+            continue
         pairs = _pairs(node)
         period = _field(pairs, "受付期間", "申込期間", "販売期間")
         ticket_url = _field(pairs, "受付URL", "販売URL")

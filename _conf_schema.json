@@ -15,8 +15,14 @@
   "brands": {"description": "展示与提醒的企划代码筛选", "type": "list", "default": [], "hint": "为空表示所有已支持企划；例如 GAKUEN、SIDEM、SHINYCOLORS。"},
   "display_timezone": {"description": "图片主展示时区", "type": "string", "default": "Asia/Shanghai"},
   "font_path": {"description": "图片字体文件路径（可选）", "type": "string", "default": "", "hint": "自动寻找 Windows 中文字体或 Linux Noto CJK；容器需安装字体或配置容器内字体路径。"},
-  "flight_provider": {"description": "机票报价数据源标识（可选）", "type": "string", "default": "", "hint": "仅记录在新建的暂停机票计划中；当前版本不会发起报价请求。"},
-  "flight_target_price_cny": {"description": "上海—东京往返心理价（人民币）", "type": "int", "default": 0, "hint": "0 表示尚未设置；当前版本只保存到暂停计划，不会自动提醒或消费 API 配额。"},
+  "flight_providers": {"description": "机票报价数据源", "type": "list", "default": [], "hint": "当前仅 serpapi 已接入；aviasales 为预留标识，不会查询。空数组不会请求。"},
+  "flight_serpapi_key": {"description": "SerpApi 密钥（可选）", "type": "string", "default": "", "hint": "仅服务器插件配置保存；未启用计划时绝不请求。"},
+  "flight_aviasales_key": {"description": "Aviasales Data API 密钥（预留）", "type": "string", "default": "", "hint": "当前只作配置预留，不能单独触发完整往返提醒。"},
+  "flight_target_price_cny": {"description": "上海—东京往返心理价（人民币）", "type": "int", "default": 0, "hint": "0 表示尚未设置；计划必须由管理员显式启用后才会检查。"},
+  "flight_serpapi_monthly_budget": {"description": "SerpApi 月度请求预算", "type": "int", "default": 0, "hint": "默认 0，禁止任何付费请求；请按账户配额显式设为正数。"},
+  "flight_max_queries_per_cycle": {"description": "每轮最多基础日期/机场组合", "type": "int", "default": 1, "hint": "每组合可能产生 1 次去程和最多 flight_max_return_expansions 次返程请求，均计入月度预算。"},
+  "flight_max_return_expansions": {"description": "每组最多展开返程候选数", "type": "int", "default": 2, "hint": "每展开一次返程需额外请求；默认最多 2 次。"},
+  "flight_interval_hours": {"description": "同一机票计划检查间隔（小时）", "type": "int", "default": 12, "hint": "同一查询跨群共享缓存；管理员手动 check 仍受预算。"},
   "max_pages": {"description": "单次活动目录最大页数", "type": "int", "default": 30, "hint": "防止上游分页异常；当前官网样本约 15 页。"}
   ,"max_special_pages": {"description": "一次同步最多抓取的官方专题页数", "type": "int", "default": 12, "hint": "单域名串行限速；目录仍会完整保存为候选，后续轮换核验。"}
   ,"ticket_query_refresh_max": {"description": "单次手动抽票查询最多复核的当前开放专题数", "type": "int", "default": 4, "hint": "只复核缓存已知、正在开放但超过新鲜度的现场抽选；不会扩大为全站爬取。"}

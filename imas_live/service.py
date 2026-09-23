@@ -46,6 +46,22 @@ VERIFIED_EVENT_SOURCES = (
 )
 
 
+def _event_type_codes(value: Any) -> set[str]:
+    """CMS event_type occurs as strings, arrays, and code-bearing objects."""
+    if isinstance(value, str):
+        return {value.casefold()}
+    if isinstance(value, dict):
+        return set().union(*(_event_type_codes(value.get(key)) for key in ("code", "value", "event_type", "type")))
+    if isinstance(value, list):
+        return set().union(*(_event_type_codes(item) for item in value))
+    return set()
+
+
+def _canonical_event_url(value: str | None) -> str:
+    parts = urlsplit(value or "")
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}{parts.path.rstrip('/').casefold()}" if parts.scheme == "https" else ""
+
+
 class ImasLiveService:
     def __init__(self, data_dir: Path, config: dict[str, Any] | None = None):
         self.config = config if config is not None else {}
@@ -82,8 +98,27 @@ class ImasLiveService:
             try:
                 if full_directory:
                     articles = await self.client.live_articles(int(self.config.get("max_pages", 30)))
-                    known_ids = {article.cms_id for article in articles}
-                    articles.extend(article for article in VERIFIED_EVENT_SOURCES if article.cms_id not in known_ids)
+                    controlled_by_url = {_canonical_event_url(source.url): source for source in VERIFIED_EVENT_SOURCES}
+                    normalized = []
+                    known_urls = set()
+                    for article in articles:
+                        url_key = _canonical_event_url(article.url)
+                        controlled = controlled_by_url.get(url_key)
+                        if controlled:
+                            # Keep the established public number if the CMS later
+                            # gives this controlled URL a different numeric ID.
+                            article = CmsArticle(controlled.cms_id, article.title, controlled.url,
+                                                 article.brands or controlled.brands, article.event_display,
+                                                 article.venue or controlled.venue, article.updated,
+                                                 {**article.raw, "controlled_source": True})
+                        if url_key and url_key in known_urls:
+                            continue
+                        normalized.append(article)
+                        if url_key:
+                            known_urls.add(url_key)
+                    normalized.extend(source for source in VERIFIED_EVENT_SOURCES
+                                      if _canonical_event_url(source.url) not in known_urls)
+                    articles = normalized
                 else:
                     known = await asyncio.to_thread(self.db.fetchable_events, int(self.config.get("max_special_pages", 12)))
                     articles = [CmsArticle(row["id"], row["title"], row["official_url"], json.loads(row["brands_json"]), row["event_display"], row["venue"], row["source_updated"], {}) for row in known]
@@ -96,7 +131,7 @@ class ImasLiveService:
                 # special-page coverage is deliberately not enough.
                 title = article.title.lower()
                 is_live = (any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical'))
-                           or str(article.raw.get("event_type", "")).casefold() == "mr_event"
+                           or "mr_event" in _event_type_codes(article.raw.get("event_type"))
                            or bool(article.raw.get("controlled_source")))
                 excluded = any(word in title for word in ('museum', 'ホテル', '脱出', '物販', '上映', '発売記念', 'popup'))
                 await asyncio.to_thread(self.db.upsert_event, self._event_record(article),

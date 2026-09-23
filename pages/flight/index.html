@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IM@S 上海 ⇄ 东京机票</title>
+  <style>
+    :root { font-family: system-ui, "Microsoft YaHei", sans-serif; color: #18392f; background: #f2f5f0; }
+    body { margin: 0; }
+    header { background: #193d32; color: white; padding: 28px max(24px, calc((100vw - 1100px)/2)); }
+    h1 { margin: 0 0 8px; font-size: clamp(25px,4vw,38px); }
+    header p { margin: 0; color: #d3e3d8; }
+    main { max-width: 1100px; margin: auto; padding: 24px; }
+    .bar, .card { background: white; border-radius: 18px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 20px #173e2510; }
+    .bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+    button { background: #193d32; color: white; border: 0; border-radius: 10px; padding: 10px 18px; cursor: pointer; }
+    .muted { color: #667a6d; }
+    .pill { display: inline-block; border-radius: 20px; padding: 4px 10px; background: #d8f5e5; color: #087b3c; font-size: 14px; }
+    .warn { background: #fff2df; color: #925300; }
+    .quote { border-top: 1px solid #e5ece7; padding: 14px 0; }
+    .price { font-size: 24px; font-weight: 700; }
+    a { color: #136947; overflow-wrap: anywhere; }
+    code { background: #edf4ee; padding: 3px 6px; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <header><h1>IM@S 上海 ⇄ 东京机票</h1><p>按已选 LIVE 场次日期监测；完整往返、实际机场与缓存状态分别显示。</p></header>
+  <main>
+    <section class="bar"><span id="budget">正在读取状态…</span><button id="refresh" type="button">刷新缓存结果</button></section>
+    <section class="card"><h2>新建计划</h2><p>在目标群聊或私聊发送 <code>/imasflight 活动编号</code> 选择场次，再由管理员发送 <code>/imasflight plan 活动编号 场次ID</code>。设置心理价、数据源密钥和月度预算后，使用 <code>/imasflight enable 计划ID</code> 显式启用。</p></section>
+    <section class="card"><h2>即将举行的 LIVE</h2><div id="activities">正在读取活动…</div></section>
+    <section id="tasks" aria-live="polite"></section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

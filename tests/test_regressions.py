@@ -202,6 +202,21 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(july), 3)
             await service.close()
 
+    async def test_mr_event_array_without_live_word_and_controlled_url_keep_one_event(self):
+        html = (Path(__file__).parent / "fixtures" / "iuoafa.html").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            service = ImasLiveService(Path(directory), {"max_special_pages": 1})
+            service.client.live_articles = AsyncMock(return_value=[CmsArticle(
+                "123456", "765 × 961 合同公演", "https://idolmaster-official.jp/live_event/IUOAFA",
+                ["IDOLMASTER"], "2027年7月24日(土)・25日(日)", "京王アリーナ TOKYO", None,
+                {"event_type": [{"code": "mr_event"}]})])
+            service.client.fetch_html = AsyncMock(return_value=html)
+            result = await service.sync()
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual([row["id"] for row in service.db.list_events(limit=10)], ["IUOAFA"])
+            self.assertEqual(len(service.db.detail("IUOAFA")["performances"]), 3)
+            await service.close()
+
     def test_ticketcol_seat_subheading_does_not_hide_sale_method(self):
         html = '<h2>一般販売(先着) 2026.8.21 UPDATE!</h2><h3>受付対象席種</h3><div class="ticketCol"><dl><dt>受付期間</dt><dd>2026年8月30日12:00～9月12日23:59</dd></dl></div>'
         row = parse_ticket_page(html, 'https://example.test').ticket_rounds[0]

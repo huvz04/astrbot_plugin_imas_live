@@ -345,7 +345,8 @@ class Database:
     def detail(self, query: str) -> dict[str, Any] | None:
         with self._connect() as db:
             event = db.execute("""SELECT e.*,n.public_number,
-                (SELECT MAX(s.fetched_at) FROM sources s WHERE s.event_id=e.id AND s.quality='verified') AS source_fetched_at FROM events e
+                (SELECT MAX(s.fetched_at) FROM sources s WHERE s.event_id=e.id AND s.quality='verified') AS source_fetched_at,
+                (SELECT s.quality FROM sources s WHERE s.event_id=e.id AND s.url=e.official_url LIMIT 1) AS source_quality FROM events e
                 LEFT JOIN event_numbers n ON n.event_id=e.id
                 WHERE e.id=? OR e.title LIKE ? ORDER BY e.id=? DESC LIMIT 1""", (query, f"%{query}%", query)).fetchone()
             if not event:

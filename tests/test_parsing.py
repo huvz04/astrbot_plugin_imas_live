@@ -50,6 +50,19 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(round_.application_end, "2026-10-28T23:59+09:00")
         self.assertIn("12か月会員", round_.eligibility or "")
 
+    def test_nested_ticket_details_keep_each_reception_fields_separate(self):
+        html = '''<details><summary>チケット</summary>
+          <details><summary>会員1次先行</summary><dl><dt>受付期間</dt><dd>2026年9月1日12:00～9月10日23:59</dd>
+          <dt>受付URL</dt><dd><a href="https://asobiticket2.asobistore.jp/receptions/first">申込</a></dd></dl></details>
+          <details><summary>会員2次先行</summary><dl><dt>受付期間</dt><dd>2026年9月11日12:00～9月20日23:59</dd>
+          <dt>受付URL</dt><dd><a href="https://asobiticket2.asobistore.jp/receptions/second">申込</a></dd></dl></details>
+        </details>'''
+        rounds = parse_ticket_page(html, "https://idolmaster-official.jp/live_event/test/").ticket_rounds
+        self.assertEqual([(r.name, r.application_end, r.url.rsplit('/', 1)[-1]) for r in rounds], [
+            ("会員1次先行", "2026-09-10T23:59+09:00", "first"),
+            ("会員2次先行", "2026-09-20T23:59+09:00", "second"),
+        ])
+
 
     def test_sidem_keeps_first_come_and_resale_distinct(self):
         result = parse_ticket_page(fixture("sidem_ticket.html"), "https://idolmaster-official.jp/live_event/sidem11th/ticket/")
