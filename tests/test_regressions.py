@@ -14,6 +14,13 @@ from test_calendar import seed
 
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Existing directory tests are offline. News discovery has separate
+        # fixtures below, rather than contacting the real feed in these tests.
+        self.news_patch = patch('imas_live.cms.OfficialCmsClient.recent_news', new_callable=AsyncMock, return_value=[])
+        self.news_patch.start()
+        self.addCleanup(self.news_patch.stop)
+
     async def test_home_follows_information_and_keeps_both_date_paragraphs(self):
         root = 'https://idolmaster-official.jp/live_event/test/'
         pages = {root: '<a href="information/">概要</a>', root + 'information/':
@@ -157,7 +164,11 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             service.db.save_parsed('good', source, 'verified-v1', 'test', [], [
                 Performance('session', '2026-10-10', '开演 18:00 JST', 'Hall',
                             evidence=Evidence(source, 'official', 'test'))], [], [])
-            service._refresh_article = AsyncMock(side_effect=[SourceUnavailable('专题未能解析'), True])
+            async def refresh(article):
+                if article.cms_id == 'bad':
+                    raise SourceUnavailable('专题未能解析')
+                return True
+            service._refresh_article = AsyncMock(side_effect=refresh)
             with self.assertLogs('imas_live.service', level='WARNING') as logs:
                 result = await service.sync(full_directory=False)
             self.assertEqual((result['failed_pages'], result['changed_pages']), (1, 1))

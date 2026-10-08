@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import CastAppearance, Performance, TicketRound
+from .cms import event_root
 
 
 def now() -> str:
@@ -301,16 +303,57 @@ class Database:
               GROUP BY e.id ORDER BY e.event_display IS NULL,e.event_display LIMIT ?""", (f"%{query}%", f"%{query}%", limit)).fetchall()
         return [dict(row) for row in rows]
 
-    def fetchable_events(self, limit: int) -> list[dict[str, Any]]:
+    def source_candidates(self, current: datetime | None = None) -> list[dict[str, Any]]:
+        current = current or datetime.now(timezone.utc)
         with self._connect() as db:
-            rows = db.execute("""SELECT e.* FROM events e LEFT JOIN sources s ON s.event_id=e.id AND s.url=e.official_url
-                WHERE e.official_url LIKE 'https://idolmaster-official.jp/live_event/%'
-                ORDER BY CASE WHEN EXISTS(SELECT 1 FROM performances p WHERE p.event_id=e.id AND p.date>=date('now'))
-                    OR NOT EXISTS(SELECT 1 FROM performances p WHERE p.event_id=e.id)
-                    OR EXISTS(SELECT 1 FROM ticket_rounds t WHERE t.event_id=e.id AND t.application_end>=date('now'))
-                    THEN 0 ELSE 1 END,
-                    COALESCE(s.attempted_at,''), e.source_updated DESC LIMIT ?""", (limit,)).fetchall()
-        return [dict(row) for row in rows]
+            rows = db.execute("""SELECT e.*,s.attempted_at,s.fetched_at,s.content_hash,s.quality AS source_quality,
+                m.value AS refresh_hint,
+                (EXISTS(SELECT 1 FROM performances p WHERE p.event_id=e.id AND p.date>=?)
+                 OR EXISTS(SELECT 1 FROM ticket_rounds t WHERE t.event_id=e.id AND t.application_end>=?)) AS active
+                FROM events e LEFT JOIN sources s ON s.event_id=e.id AND s.url=e.official_url
+                LEFT JOIN meta m ON m.key='refresh_hint:' || e.id""", (current.date().isoformat(), current.date().isoformat())).fetchall()
+        result = []
+        for raw in rows:
+            row = dict(raw)
+            if not event_root(row['official_url']):
+                continue
+            try:
+                updated = datetime.fromtimestamp(float(row['source_updated']), timezone.utc)
+            except (ValueError, TypeError, OSError, OverflowError):
+                updated = datetime.min.replace(tzinfo=timezone.utc)
+            years = [int(y) for y in re.findall(r'20\d{2}', row['event_display'] or '')]
+            recent_unknown = not years and updated >= current - timedelta(days=60)
+            row['active'] = bool(row['active'] or recent_unknown)
+            row['hint_pending'] = bool(row['refresh_hint'] and row['refresh_hint'] > (row['attempted_at'] or ''))
+            result.append(row)
+        result.sort(key=lambda r: (not r['hint_pending'], r['attempted_at'] or '', -(float(r['source_updated']) if str(r['source_updated']).isdigit() else 0), r['id']))
+        return result
+
+    def fetchable_events(self, limit: int) -> list[dict[str, Any]]:
+        rows = self.source_candidates()
+        active = [row for row in rows if row['active'] or row['hint_pending']]
+        historical = [row for row in rows if not row['active'] and not row['hint_pending']]
+        # Undated old failures must not displace ongoing events. Reserve one
+        # history slot so the lower-priority queue still makes progress.
+        budget = max(1, limit)
+        slots = budget - int(bool(historical and active and budget > 1))
+        selected = active[:slots]
+        return selected + historical[:budget - len(selected)]
+
+    def sync_diagnostics(self, freshness_hours: int = 12, current: datetime | None = None) -> dict[str, Any]:
+        current = current or datetime.now(timezone.utc)
+        rows = self.source_candidates(current)
+        cutoff = (current.astimezone(timezone.utc) - timedelta(hours=freshness_hours)).isoformat(timespec='seconds')
+        pending = [r for r in rows if r['source_quality'] != 'verified' or not r['fetched_at'] or r['fetched_at'] < cutoff]
+        successful = [r['fetched_at'] for r in rows if r['content_hash'] and r['fetched_at']]
+        return {'candidate_total': len(rows), 'active_candidates': sum(r['active'] for r in rows),
+                'pending_verification': len(pending), 'active_pending': sum(r['active'] for r in pending),
+                'never_checked': sum(not r['attempted_at'] for r in rows),
+                'last_source_success': max(successful, default=None),
+                'last_directory_sync': self.meta('last_directory_sync'),
+                'last_sync_attempt': self.meta('last_sync_attempt'),
+                'last_news_discovery': self.meta('last_news_discovery'),
+                'last_news_error': self.meta('last_news_error'), 'last_error': self.meta('last_error')}
 
     def events_by_ids(self, event_ids: Iterable[str]) -> list[dict[str, Any]]:
         values = list(dict.fromkeys(str(item) for item in event_ids if item))

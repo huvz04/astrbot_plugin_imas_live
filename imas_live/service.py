@@ -21,7 +21,7 @@ import httpx
 from bs4 import BeautifulSoup
 from PIL import Image
 
-from .cms import CmsArticle, OfficialCmsClient, SourceUnavailable
+from .cms import CmsArticle, OfficialCmsClient, SourceUnavailable, event_root
 from .database import Database
 from .parsing import parse_shiny_information, parse_day_cast, official_roster_image_urls, parse_ticket_page, parse_venue, parse_information, schedule_performances, clean
 from .models import ParsedPage
@@ -96,10 +96,14 @@ class ImasLiveService:
         if self._sync_lock.locked():
             return {"status": "already_running"}
         async with self._sync_lock:
+            self.db.set_meta('last_sync_attempt', datetime.now(timezone.utc).isoformat(timespec='seconds'))
+            directory_error = None
             try:
                 if full_directory:
                     articles = await self.client.live_articles(int(self.config.get("max_pages", 30)))
                     controlled_by_url = {_canonical_event_url(source.url): source for source in VERIFIED_EVENT_SOURCES}
+                    discovered = {_canonical_event_url(row['official_url']): row for row in self.db.list_events(limit=10000)
+                                  if row['id'].startswith('news:')}
                     normalized = []
                     known_urls = set()
                     for article in articles:
@@ -112,7 +116,9 @@ class ImasLiveService:
                                                  article.brands or controlled.brands, article.event_display,
                                                  article.venue or controlled.venue, article.updated,
                                                  {**article.raw, "controlled_source": True})
-                        if url_key and url_key in known_urls:
+                        elif url_key in discovered:
+                            article.cms_id = discovered[url_key]['id']
+                        if controlled and url_key in known_urls:
                             continue
                         normalized.append(article)
                         if url_key:
@@ -127,14 +133,18 @@ class ImasLiveService:
                 self.db.set_meta("last_error", str(exc))
                 if full_directory:
                     self.directory_attempted.set()
-                return {"status": "failed", "error": str(exc)}
+                directory_error = str(exc)
+                full_directory = False
+                known = await asyncio.to_thread(self.db.fetchable_events, int(self.config.get('max_special_pages', 12)))
+                articles = [CmsArticle(row['id'], row['title'], row['official_url'], json.loads(row['brands_json']),
+                                       row['event_display'], row['venue'], row['source_updated'], {}) for row in known]
             directory_was_complete = self.db.meta("baseline_complete") is not None
             for article in articles:
                 # Only a newly discovered entry in a later *complete* directory
                 # can prove that the event itself is newly announced.  Partial
                 # special-page coverage is deliberately not enough.
                 title = article.title.lower()
-                is_live = (any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical'))
+                is_live = (any(word in title for word in ('live', 'st@ge', 'stage', 'ライブ', 'musical', 'concert', 'orchestra', '演奏会'))
                            or "mr_event" in _event_type_codes(article.raw.get("event_type"))
                            or bool(article.raw.get("controlled_source")))
                 excluded = any(word in title for word in ('museum', 'ホテル', '脱出', '物販', '上映', '発売記念', 'popup'))
@@ -149,6 +159,7 @@ class ImasLiveService:
                 self.db.set_meta('last_directory_sync', datetime.now(timezone.utc).isoformat(timespec='seconds'))
                 self.directory_ready.set()
                 self.directory_attempted.set()
+                await self._discover_news_sources()
                 known = await asyncio.to_thread(self.db.fetchable_events, max(1, int(self.config.get('max_special_pages', 12))))
                 articles = [CmsArticle(row['id'], row['title'], row['official_url'], json.loads(row['brands_json']), row['event_display'], row['venue'], row['source_updated'], {}) for row in known]
             changed, failed = 0, 0
@@ -175,13 +186,72 @@ class ImasLiveService:
                     except Exception:
                         logger.exception("IM@S failed to record source error: event=%s source=%s", article.cms_id, article.url)
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            self.db.set_meta("last_successful_sync", stamp)
+            if len(articles) > failed:
+                self.db.set_meta("last_successful_sync", stamp)
             with self.db._connect() as db:
                 unverified = db.execute("SELECT COUNT(*) FROM sources WHERE quality='stale'").fetchone()[0]
-            self.db.set_meta('last_error', f'{unverified} 个专题待核验' if unverified else '')
+            self.db.set_meta('last_error', directory_error or (f'{unverified} 个专题待核验' if unverified else ''))
             first = self.db.meta("baseline_complete") is None
-            self.db.set_meta("baseline_complete", "1")
-            return {"status": "ok", "events": len(articles), "changed_pages": changed, "failed_pages": failed, "baseline": first}
+            if full_directory:
+                self.db.set_meta("baseline_complete", "1")
+            return {"status": "failed" if directory_error else "ok", "error": directory_error,
+                    "events": len(articles), "changed_pages": changed, "failed_pages": failed, "baseline": first,
+                    "diagnostics": self.db.sync_diagnostics(int(self.config.get('freshness_hours', 12)))}
+
+    async def _discover_news_sources(self) -> None:
+        """Discover event roots only from actual links in a bounded official news feed."""
+        stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        baseline = self._ticket_moment(self.db.meta('news_discovery_baseline'))
+        try:
+            news = await self.client.recent_news()
+            existing = {_canonical_event_url(row['official_url']): row for row in self.db.list_events(limit=10000)}
+            attempted = 0
+            errors = []
+            for item in news:
+                title, page = str(item.get('title', '')), str(item.get('path') or '')
+                if not page or not re.fullmatch(r'[A-Za-z0-9_-]+', page) or not any(
+                        term in title.casefold() for term in ('live', 'ライブ', '公演', 'チケット', '先行', '抽選', 'concert')):
+                    continue
+                marker = 'news_seen:' + str(item.get('_id') or page)
+                revision = str(item.get('updated') or '')
+                if self.db.meta(marker) == revision:
+                    continue
+                if attempted >= 32:
+                    break
+                attempted += 1
+                try:
+                    html = await self.client.article_content(page)
+                except SourceUnavailable as exc:
+                    errors.append(f'{page}: {exc}')
+                    continue  # Leave the revision unacknowledged for a later retry.
+                soup = BeautifulSoup(html, 'html.parser')
+                for anchor in soup.select('a[href]'):
+                    root = event_root(urljoin('https://idolmaster-official.jp/news/' + page + '.html', anchor['href']))
+                    if not root:
+                        continue
+                    key = _canonical_event_url(root)
+                    row = existing.get(key)
+                    if row is None:
+                        brands = [str(b['code']) for b in item.get('brand', []) if isinstance(b, dict) and b.get('code')]
+                        article = CmsArticle('news:' + hashlib.sha256(key.encode()).hexdigest()[:16], title,
+                                             root, brands, None, None, item.get('updated'), {})
+                        try:
+                            news_updated = datetime.fromtimestamp(float(item.get('updated')), timezone.utc)
+                        except (ValueError, TypeError, OSError, OverflowError):
+                            news_updated = None
+                        self.db.upsert_event(self._event_record(article), bool(
+                            baseline and news_updated and news_updated > baseline))
+                        row = {'id': article.cms_id, 'official_url': root}
+                        existing[key] = row
+                    self.db.set_meta('refresh_hint:' + row['id'], stamp)
+                self.db.set_meta(marker, revision)
+            self.db.set_meta('last_news_discovery', stamp)
+            self.db.set_meta('last_news_error', '; '.join(errors)[:1000])
+            if baseline is None:
+                self.db.set_meta('news_discovery_baseline', stamp)
+        except SourceUnavailable as exc:
+            self.db.set_meta('last_news_error', str(exc))
+            logger.warning('IM@S news discovery unavailable: %s', exc)
 
     async def _refresh_article(self, article: CmsArticle) -> bool:
         """Refresh one already-known official event without broad directory work."""
@@ -193,7 +263,7 @@ class ImasLiveService:
             'performances': [vars_for_slots(row) for row in parsed.performances],
             'cast': [vars_for_slots(row) for row in parsed.cast],
         }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        changed = await asyncio.to_thread(self.db.save_parsed, article.cms_id, article.url, digest, "special-page-v2", parsed.ticket_rounds, parsed.performances, parsed.cast, parsed.review_notes)
+        changed = await asyncio.to_thread(self.db.save_parsed, article.cms_id, article.url, digest, "special-page-v3", parsed.ticket_rounds, parsed.performances, parsed.cast, parsed.review_notes)
         assets = await self._cache_roster_assets(article.cms_id, article.url, parsed.cast_asset_urls)
         if assets:
             await asyncio.to_thread(self.db.save_cast_assets, article.cms_id, article.url, assets)
@@ -217,7 +287,8 @@ class ImasLiveService:
             except (TypeError, ValueError):
                 active = False
             if active and not self._source_is_fresh(row, current):
-                ids.append(row["event_id"])
+                if row["event_id"] not in ids:
+                    ids.append(row["event_id"])
         if not ids or self._sync_lock.locked():
             return {"refreshed": 0, "failed": 0}
         raw = await asyncio.to_thread(self.db.events_by_ids, ids[:max(1, int(self.config.get("ticket_query_refresh_max", 4)))])
@@ -267,11 +338,24 @@ class ImasLiveService:
                 now_at_deadline = current.astimezone(deadline.tzinfo)
             except (TypeError, ValueError):
                 continue
-            if start <= now_at_deadline < deadline and deadline - now_at_deadline <= horizon and not self._source_is_fresh(row, current):
+            if start.tzinfo and deadline.tzinfo and start < deadline and now_at_deadline < deadline and (
+                    start <= now_at_deadline or start - now_at_deadline <= horizon) and not self._source_is_fresh(row, current):
                 ids.append(str(row["event_id"]))
         if not ids or self._sync_lock.locked():
             return {"refreshed": 0, "failed": 0}
-        rows = await asyncio.to_thread(self.db.events_by_ids, ids)
+        candidates = await asyncio.to_thread(self.db.source_candidates, current)
+        due_ids = set(ids)
+        selected = []
+        for candidate in candidates:
+            if candidate['id'] not in due_ids:
+                continue
+            attempted = self._ticket_moment(candidate['attempted_at'])
+            if attempted and timedelta(0) <= current - attempted < timedelta(minutes=5):
+                continue
+            selected.append(candidate['id'])
+            if len(selected) >= max(1, int(self.config.get('ticket_query_refresh_max', 4))):
+                break
+        rows = await asyncio.to_thread(self.db.events_by_ids, selected)
         refreshed = failed = 0
         async with self._sync_lock:
             for row in rows:
@@ -301,7 +385,10 @@ class ImasLiveService:
 
     async def _collect_special(self, article: CmsArticle) -> ParsedPage:
         """Follow actual links under this event only, including HTML meta redirects."""
-        root = 'https://idolmaster-official.jp/live_event/' + urlsplit(article.url).path.split('/')[2] + '/'
+        root = event_root(article.url)
+        if not root:
+            raise SourceUnavailable('不支持的官方专题地址')
+        roots = {root}
         queue, visited = [article.url], set()
         selected_stop = None
         result = ParsedPage()
@@ -311,7 +398,7 @@ class ImasLiveService:
             if url in visited:
                 continue
             visited.add(url)
-            html = await self.client.fetch_html(url)
+            html = await self.client.event_html(url)
             soup = BeautifulSoup(html, 'html.parser')
             # The Shirube home links several cities. Bind the city before following ticket redirects.
             if 'gkmas_livetour_shirube' in root and selected_stop is None:
@@ -324,6 +411,9 @@ class ImasLiveService:
                         queue.insert(0, destination)
                         break
             parsed = parse_ticket_page(html, url)
+            if not parsed.ticket_rounds and any(
+                    clean(dt.get_text(' ')) in {'受付期間', '申込期間', '販売期間'} for dt in soup.select('dt')):
+                raise SourceUnavailable('官网有申请字段但未能解析票务轮次，保留旧记录')
             result.review_notes.extend(parsed.review_notes)
             for row in parsed.ticket_rounds:
                 ticket_rows[row.stable_key] = row
@@ -352,16 +442,23 @@ class ImasLiveService:
                         destinations.append(urljoin(url, content.split('=', 1)[1].strip(' \"\'')))
             for a in soup.select('a[href]'):
                 destination = urldefrag(urljoin(url, a['href']))[0]
-                if any(part in destination[len(root):].lower() for part in ('ticket', 'information')):
+                if any(part in destination[len(root):].lower() for part in ('ticket', 'information', 'cast')):
+                    destinations.append(destination)
+                target_root = event_root(destination)
+                if '/live_events/' in root and target_root and '/live_event/' in target_root and any(
+                        term in clean(a.get_text(' ')) for term in ('公式', '特設', 'チケット')):
+                    roots.add(target_root)
                     destinations.append(destination)
             for destination in dict.fromkeys(destinations):
-                if not destination.startswith(root) or destination in visited or destination in queue:
+                if not any(destination.startswith(allowed) for allowed in roots) or destination in visited or destination in queue:
                     continue
                 if selected_stop and destination.endswith('.php') and destination.rsplit('/', 1)[-1] != selected_stop:
                     continue
                 if 'gkmas_livetour_shirube' in root and not selected_stop and destination != article.url:
                     continue
                 queue.append(destination)
+        if queue:
+            raise SourceUnavailable('专题链接超过单轮8页上限，未完成核验，保留旧记录')
         result.ticket_rounds = list(ticket_rows.values())
         result.cast_asset_urls = list(dict.fromkeys(result.cast_asset_urls))
         return result
@@ -396,7 +493,7 @@ class ImasLiveService:
 
     @staticmethod
     def _fetchable_special_page(url: str | None) -> bool:
-        return bool(url and url.startswith("https://idolmaster-official.jp/live_event/"))
+        return event_root(url) is not None
 
     async def events(self, query: str = "") -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.db.list_events, query)
@@ -522,39 +619,27 @@ class ImasLiveService:
             return False
 
     async def ticket_entries(self, current: datetime | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str]:
-        """Build cards solely for fresh, currently-open verified onsite lotteries."""
+        """Show all collected onsite lotteries; freshness affects status, not visibility."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
         start, end, _ = self._month_window(current, None)
         rows = await asyncio.to_thread(self.db.ticket_query_rows)
         entries: list[dict[str, Any]] = []
-        time_unverified = invalid_range = stale_source = 0
         for row in rows:
             if not self._brand_allowed(row["brands_json"]):
                 continue
-            try:
-                deadline = datetime.fromisoformat(row["application_end"])
-                application_start = datetime.fromisoformat(row["application_start"])
-                if deadline.tzinfo is None or application_start.tzinfo is None:
-                    raise ValueError
-            except (TypeError, ValueError):
-                time_unverified += 1
-                continue
-            now_at_ticket_zone = current.astimezone(deadline.tzinfo)
-            if not (application_start <= now_at_ticket_zone < deadline):
-                continue
-            if deadline <= application_start:
-                invalid_range += 1
-                continue
-            if not self._source_is_fresh(row, current):
-                stale_source += 1
-                continue
-            remaining = deadline - now_at_ticket_zone
-            ticket_status, status_label = ("urgent", "24小时内截止") if remaining <= timedelta(hours=24) else ("open", "正在抽选")
+            application_start = self._ticket_moment(row.get("application_start"))
+            deadline = self._ticket_moment(row.get("application_end"))
+            ticket_status, status_label = self._ticket_display_status(row, current)
             details = [f"轮次：{row['name']}"]
             if application_start:
                 details.append(self._ticket_time(row["application_start"], "开始", zone))
-            details.append(self._ticket_time(row["application_end"], "截止", zone))
+            else:
+                details.append("开始：待核验")
+            if deadline:
+                details.append(self._ticket_time(row["application_end"], "截止", zone))
+            else:
+                details.append("截止：待核验")
             if row.get("performance_date") or row.get("performance_venue"):
                 details.append("演出：" + "｜".join(part for part in (
                     str(row["performance_date"]).replace("-", "/") if row.get("performance_date") else "",
@@ -563,20 +648,43 @@ class ImasLiveService:
             entries.append({"kind": "ticket", "title": row["title"], "subtitle": "\n".join(details),
                             "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"],
                             "ticket_status": ticket_status, "status_label": status_label,
-                            "public_number": row.get("public_number"), "sort_time": deadline, "source_fetched_at": row.get("source_fetched_at")})
-        priority = {"urgent": 0, "open": 1}
-        entries.sort(key=lambda item: (priority[item["ticket_status"]], item["sort_time"], item["title"], item["subtitle"]))
-        status = self._status(current, zone)
-        diagnostics = []
-        if stale_source:
-            diagnostics.append(f"{stale_source} 个当前开放轮次的专题缓存待复核")
-        if time_unverified:
-            diagnostics.append(f"{time_unverified} 个轮次起止时间待核验")
-        if invalid_range:
-            diagnostics.append(f"{invalid_range} 个轮次时间范围异常")
-        if diagnostics:
-            status += "｜" + "；".join(diagnostics)
-        return entries, start, end, status
+                            "event_id": row["event_id"], "public_number": row.get("public_number"),
+                            "sort_time": deadline or datetime.max.replace(tzinfo=timezone.utc),
+                            "source_fetched_at": row.get("source_fetched_at")})
+        priority = {"urgent": 0, "open": 1, "upcoming": 2, "stale": 3, "unknown": 3, "ended": 4}
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for entry in entries:
+            groups.setdefault(entry["event_id"], []).append(entry)
+        for group in groups.values():
+            group.sort(key=lambda item: (priority[item["ticket_status"]], item["sort_time"], item["subtitle"]))
+        ordered = sorted(groups.values(), key=lambda group: (
+            priority[group[0]["ticket_status"]], group[0]["sort_time"], group[0]["title"], group[0]["event_id"]))
+        return [item for group in ordered for item in group], start, end, self._status(current, zone)
+
+    @staticmethod
+    def _ticket_moment(value: str | None) -> datetime | None:
+        try:
+            stamp = datetime.fromisoformat(value)
+            return stamp if stamp.tzinfo else None
+        except (ValueError, TypeError):
+            return None
+
+    def _ticket_display_status(self, row: dict[str, Any], current: datetime) -> tuple[str, str]:
+        start = self._ticket_moment(row.get("application_start"))
+        end = self._ticket_moment(row.get("application_end"))
+        if end and current >= end and (not start or end > start):
+            status, label = "ended", "已结束"
+        elif not start or not end or end <= start:
+            status, label = "unknown", "时间待核验"
+        elif current < start:
+            status, label = "upcoming", "未开始"
+        elif end - current <= timedelta(hours=24):
+            status, label = "urgent", "24小时内截止"
+        else:
+            status, label = "open", "抽选中"
+        if not self._source_is_fresh(row, current):
+            return ("ended" if status == "ended" else "stale"), label + " · 待核验"
+        return status, label
 
     @staticmethod
     def _performance_moment(row: dict[str, Any], zone: ZoneInfo) -> tuple[datetime | None, bool]:
@@ -666,25 +774,19 @@ class ImasLiveService:
         tickets = [row for row in detail["tickets"] if row.get("ticket_scope") == "onsite"]
         result: list[dict[str, Any]] = []
         for row in tickets:
-            status = "待核验"
-            try:
-                start = datetime.fromisoformat(row["application_start"])
-                end = datetime.fromisoformat(row["application_end"])
-                now_ticket = current.astimezone(end.tzinfo)
-                status = "正在抽选" if start <= now_ticket < end and row["sale_method"] == "lottery" else ("抽选已结束" if now_ticket >= end else "尚未开始")
-            except (TypeError, ValueError):
-                end = None
+            ticket_status, status = self._ticket_display_status({**row,
+                'source_fetched_at': event.get('source_fetched_at'), 'source_quality': event.get('source_quality')}, current)
             if row["sale_method"] == "first_come":
-                status = "一般销售/先到先得"
+                status, ticket_status = "一般销售/先到先得", "unknown"
             elif row["sale_method"] == "resale":
-                status = "官方转售"
+                status, ticket_status = "官方转售", "unknown"
             details = [f"{status}｜{row['name']}"]
             if row.get("application_end"):
                 try: details.append(self._ticket_time(row["application_end"], "截止", zone))
                 except ValueError: details.append("截止时间待核验")
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "\n".join(details),
                            "brands": json.loads(event["brands_json"]), "url": row.get("url") or row.get("source_url"),
-                           "ticket_status": "open" if status == "正在抽选" else "unknown", "status_label": status,
+                           "ticket_status": ticket_status, "status_label": status,
                            "public_number": event["public_number"], "sort_time": row.get("application_end") or "", "source_fetched_at": event.get("source_fetched_at")})
         if not result:
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "尚未公布可核验的现场票务轮次。",
@@ -713,10 +815,7 @@ class ImasLiveService:
             umos = [str(x["umo"]) for x in db.execute("SELECT umo FROM ticket_group_subscriptions WHERE enabled=1")]
         selected: list[dict[str, Any]] = []
         for row in rows:
-            try:
-                if row['source_quality'] != 'verified' or current.astimezone(timezone.utc) - datetime.fromisoformat(row['source_fetched_at']) > timedelta(hours=max(1, int(self.config.get('freshness_hours', 12)))):
-                    continue
-            except (TypeError, ValueError):
+            if not self._source_is_fresh(row, current):
                 continue
             if not self._brand_allowed(row["brands_json"]):
                 continue
@@ -726,7 +825,8 @@ class ImasLiveService:
             except ValueError:
                 continue
             now_at_deadline_zone = current.astimezone(deadline.tzinfo)
-            if not (started and started.tzinfo and started <= now_at_deadline_zone):
+            if not (deadline.tzinfo and started and started.tzinfo and started < deadline
+                    and started <= now_at_deadline_zone < deadline):
                 continue
             deadline_text, local = self._display_deadline(row["application_end"], zone)
             eligible_nodes = []
@@ -790,13 +890,13 @@ class ImasLiveService:
                 pass
             if end and end.tzinfo and current.astimezone(end.tzinfo) >= end:
                 continue
-            if start and start.tzinfo:
+            if start and end and start.tzinfo and end.tzinfo and end > start:
                 if current.astimezone(start.tzinfo) < start:
                     status, ticket_status = "新抽选已公布／尚未开始", "upcoming"
                 else:
                     status, ticket_status = "新抽选现已开放", "open"
             else:
-                status, ticket_status = "新抽选已公布／开始时间待核验", "unknown"
+                status, ticket_status = "新抽选已公布／起止时间待核验", "unknown"
             times: list[str] = []
             if start and start.tzinfo:
                 times.append(self._ticket_time(row["application_start"], "开始", zone))

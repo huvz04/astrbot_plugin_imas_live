@@ -6,6 +6,7 @@ import asyncio
 import json
 import random
 import time
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,14 @@ import httpx
 
 BASE = "https://cmsapi-frontend.idolmaster-official.jp/sitern/api/"
 OFFICIAL = "https://idolmaster-official.jp"
+
+
+def event_root(url: str | None) -> str | None:
+    parts = urlsplit(url or '')
+    path = parts.path.strip('/').split('/')
+    if parts.scheme == 'https' and parts.netloc == 'idolmaster-official.jp' and len(path) >= 2 and path[0] in ('live_event', 'live_events', 'lp'):
+        return f'{OFFICIAL}/{path[0]}/{path[1]}/'
+    return None
 
 
 class SourceUnavailable(RuntimeError):
@@ -116,6 +125,42 @@ class OfficialCmsClient:
             raise SourceUnavailable("官网未返回匿名令牌。")
         self._token = token
         return token
+
+    async def article_content(self, page: str, article_type: str | None = None) -> str:
+        """The public Article/get endpoint used by the official site's frontend."""
+        data = {"page": page}
+        if article_type:
+            data['article_type'] = article_type
+        payload = await self._get('idolmaster/Article/get', {
+            'site': 'jp', 'ip': 'idolmaster', 'token': await self.token(), 'data': json.dumps(data)})
+        article = payload.get('data', {}).get('article')
+        content = article.get('content') if isinstance(article, dict) else None
+        if not isinstance(content, str) or '<' not in content:
+            raise SourceUnavailable('官网正文未返回可解析 HTML')
+        return content
+
+    async def event_html(self, url: str) -> str:
+        root = event_root(url)
+        if root and '/live_events/' in root:
+            return await self.article_content(urlsplit(root).path.strip('/').split('/')[1], 'detail_page')
+        if root and '/lp/' in root:
+            return await self.article_content(urlsplit(root).path.strip('/').split('/')[1], 'lp_detail')
+        return await self.fetch_html(url)
+
+    async def recent_news(self) -> list[dict[str, Any]]:
+        """Bounded discovery feed; never claim this is a complete news archive."""
+        rows = []
+        for start in range(0, 96, 24):
+            payload = await self._get('idolmaster/Article/list', {
+                'site': 'jp', 'ip': 'idolmaster', 'token': await self.token(), 'start': start,
+                'limit': 24, 'data': json.dumps({'category': ['NEWS']})})
+            batch = payload['data'].get('article_list')
+            if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                raise SourceUnavailable('官网新闻列表结构异常')
+            rows.extend(batch)
+            if len(batch) < 24:
+                break
+        return rows
 
     async def live_articles(self, max_pages: int = 30, page_size: int = 12) -> list[CmsArticle]:
         await self.token()

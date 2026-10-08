@@ -86,12 +86,14 @@ class QueryTests(unittest.TestCase):
             by_round = {entry["subtitle"].splitlines()[0]: entry for entry in entries}
             self.assertEqual(by_round["轮次：恰好24小时"]["ticket_status"], "urgent")
             self.assertEqual(by_round["轮次：开放超过窗口"]["ticket_status"], "open")
-            self.assertNotIn("轮次：窗口内即将开始", by_round)
-            self.assertNotIn("轮次：尚未开始不能标开放", by_round)
-            self.assertNotIn("轮次：开始待核验", by_round)
-            self.assertNotIn("轮次：陈旧缓存", by_round)
-            self.assertNotIn("轮次：窗口外才开始", by_round)
-            self.assertNotIn("轮次：已经截止", by_round)
+            self.assertEqual(by_round["轮次：窗口内即将开始"]["ticket_status"], "upcoming")
+            self.assertEqual(by_round["轮次：尚未开始不能标开放"]["ticket_status"], "upcoming")
+            self.assertEqual(by_round["轮次：开始待核验"]["ticket_status"], "unknown")
+            self.assertEqual(by_round["轮次：陈旧缓存"]["ticket_status"], "stale")
+            self.assertIn("待核验", by_round["轮次：陈旧缓存"]["status_label"])
+            self.assertEqual(by_round["轮次：窗口外才开始"]["ticket_status"], "upcoming")
+            self.assertEqual(by_round["轮次：已经截止"]["ticket_status"], "ended")
+            self.assertEqual(len(entries), 8)
             self.assertIn("北京时间", by_round["轮次：恰好24小时"]["subtitle"])
             self.assertIn("JST", by_round["轮次：恰好24小时"]["subtitle"])
             asyncio.run(service.close())
@@ -102,9 +104,9 @@ class QueryTests(unittest.TestCase):
             evidence = Evidence("https://example.test/stale", "official", "test")
             add_event(service, "stale-only", (), [TicketRound("round", "仍开放但缓存旧", "onsite", "lottery", "2026-09-01T00:00+09:00", "2026-09-20T23:59+09:00", evidence=evidence)], source_quality="stale")
             entries, _, _, status = asyncio.run(service.ticket_entries(CURRENT))
-            self.assertEqual(entries, [])
-            self.assertIn("当前开放轮次的专题缓存待复核", status)
-            self.assertNotIn("截止待核验", status)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]['ticket_status'], 'stale')
+            self.assertEqual(entries[0]['status_label'], '抽选中 · 待核验')
             asyncio.run(service.close())
 
     def test_manual_ticket_query_rechecks_only_active_stale_official_pages(self):
@@ -130,11 +132,15 @@ class QueryTests(unittest.TestCase):
                 {"kind": "ticket", "title": "open", "subtitle": "轮次：open\n截止：2026/10/01", "brands": ["SIDEM"], "ticket_status": "open", "status_label": "正在抽选"},
                 {"kind": "ticket", "title": "upcoming", "subtitle": "轮次：upcoming\n开始：2026/09/20", "brands": ["SHINYCOLORS"], "ticket_status": "upcoming", "status_label": "即将开始"},
                 {"kind": "ticket", "title": "unknown", "subtitle": "轮次：unknown\n截止：2026/09/12", "brands": ["876_PRO"], "ticket_status": "unknown", "status_label": "开放状态待核验"},
+                {"kind": "ticket", "title": "ended", "subtitle": "轮次：ended\n截止：2026/09/01", "brands": ["GAKUEN"], "ticket_status": "ended", "status_label": "已结束"},
+                {"kind": "ticket", "title": "stale", "subtitle": "轮次：stale\n截止：2026/10/01", "brands": ["SIDEM"], "ticket_status": "stale", "status_label": "抽选中 · 待核验"},
             ]
             path = renderer.render_ticket(entries, CURRENT.date(), (CURRENT + timedelta(days=30)).date(), CURRENT, "目录更新")
             with Image.open(path) as image:
                 self.assertEqual(image.format, "PNG")
                 self.assertEqual(image.width, 1080)
                 self.assertGreater(image.height, 900)
-                self.assertEqual(image.getpixel((250, 240)), (255, 243, 243))
-                self.assertEqual(image.getpixel((250, 445)), (239, 250, 242))
+                colors = image.getcolors(image.width * image.height)
+                self.assertIn((255, 243, 243), [color for _, color in colors])
+                self.assertIn((239, 250, 242), [color for _, color in colors])
+                self.assertIn((244, 246, 248), [color for _, color in colors])

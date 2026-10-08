@@ -9,10 +9,11 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from html import escape
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .models import CastAppearance, Evidence, ParsedPage, Performance, TicketRound
 
@@ -28,6 +29,43 @@ YEAR = re.compile(r"(20\d{2})[年./]")
 
 def clean(value: str) -> str:
     return SPACE.sub(" ", unicodedata.normalize("NFKC", value)).strip()
+
+
+def _page_soup(html: str) -> BeautifulSoup:
+    """Expose explicit CMS component labels as semantic fields, without guessing dates."""
+    soup = BeautifulSoup(html, 'html.parser')
+    labels = {'受付期間', '申込期間', '販売期間', '受付URL', '販売URL', '当落発表', '結果発表',
+              '入金期間', '支払期間', '枚数制限', '開催日時', '開催場所', '公演日時'}
+    sections, fields, title = [], [], ''
+
+    def flush():
+        if fields:
+            sections.append('<section class="p-ticket__group"><h2>' + escape(title or '未命名受理')
+                            + '</h2><dl>' + ''.join(fields) + '</dl></section>')
+            fields.clear()
+
+    for node in soup.select('[data-type="component-livetext_v2"]'):
+        label = clean(node.get_text(' '))
+        if label not in labels:
+            if len(label) < 160 and _method(label) != 'unknown':
+                flush()
+                title = label
+            continue
+        value = node.find_next(attrs={'data-type': ['component-text', 'component-livetext_v2']})
+        if value is None or value.get('data-type') != 'component-text':
+            continue
+        if label in {'開催日時', '公演日時', '開催場所'}:
+            # Notices below a schedule can mention historical date ranges.
+            text = value.get_text('\n', strip=True).split('※', 1)[0]
+            sections.append('<dl><dt>' + label + '</dt><dd>' + escape(text) + '</dd></dl>')
+        else:
+            if any(f'<dt>{label}</dt>' in item for item in fields):
+                flush()  # Never overwrite a second reception's period/link.
+            fields.append('<dt>' + label + '</dt><dd>' + value.decode_contents() + '</dd>')
+    flush()
+    if sections:
+        soup.append(BeautifulSoup(''.join(sections), 'html.parser'))
+    return soup
 
 
 def stable(*values: str) -> str:
@@ -91,11 +129,16 @@ def _nearest_title(node: Tag) -> str:
         heading = node.find("summary", recursive=False)
         if heading:
             return clean(heading.get_text(" "))
-    accordion = node.find_parent('dl', class_=lambda value: value in {'accordionList', 'accordion'})
+    accordion = node.find_parent('dl', class_=lambda value: value in {'accordionList', 'accordion', 'c-accordion'})
     if accordion:
         heading = accordion.find("dt", recursive=False)
         if heading:
             return clean(heading.get_text(" "))
+    accordion = node.find_parent(class_='p-ticket__accordion')
+    if accordion:
+        heading = accordion.find(['button', 'h2', 'h3', 'h4'])
+        if heading:
+            return clean(heading.get_text(' '))
     details = node.find_parent("details")
     if details:
         heading = details.find("summary")
@@ -109,7 +152,7 @@ def _nearest_title(node: Tag) -> str:
     while ancestor:
         if ancestor.name in {"section", "details", "dl"}:
             title = ancestor.find(["h2", "h3", "h4", "summary", "dt"], recursive=False)
-            if title:
+            if title and not any(term in clean(title.get_text(' ')) for term in ('受付期間', '受付URL', '入金期間', '当落発表')):
                 return clean(title.get_text(" "))
         ancestor = ancestor.parent if isinstance(ancestor.parent, Tag) else None
     previous = node.find_previous(["h2", "h3", "h4"])
@@ -145,10 +188,11 @@ def _range(value: str | None) -> tuple[str | None, str | None]:
     if not value:
         return None, None
     normalized = clean(value)
-    first = japan_datetime(normalized)
-    inherited = int(first[:4]) if first else None
     # The second half commonly omits its year; only inherit an explicit first year.
     parts = re.split(r"(?:~|〜|～|\u301c)", normalized, maxsplit=1)
+    first = japan_datetime(parts[0])
+    first_year = YEAR.search(parts[0])
+    inherited = int(first[:4]) if first else (int(first_year.group(1)) if first_year else None)
     second = japan_datetime(parts[1], inherited) if len(parts) == 2 else None
     if first and second and second < first:
         # An omitted year may roll into January; other reversed ranges are unsafe.
@@ -161,10 +205,18 @@ def _range(value: str | None) -> tuple[str | None, str | None]:
 
 def parse_venue(html: str) -> str | None:
     """Extract an event venue only from explicit official venue fields."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _page_soup(html)
 
     def value_of(node: Tag) -> str:
-        return clean(re.sub(r"https?://\S+", "", node.get_text(" ")))
+        # Some official pages omit a closing dd: html.parser then nests the
+        # next dt/ARTIST/ticket-price fields inside the venue. Stop there.
+        parts = []
+        for child in node.descendants:
+            if isinstance(child, Tag) and child.name in {'dt', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+                break
+            if isinstance(child, NavigableString):
+                parts.append(str(child))
+        return clean(re.sub(r"https?://\S+", "", ' '.join(parts)))
 
     for dt in soup.select("dt"):
         label = clean(dt.get_text(" "))
@@ -185,6 +237,8 @@ def parse_venue(html: str) -> str | None:
         if clean(heading.get_text(" ")) not in {"開催場所", "会場"}:
             continue
         detail = heading.find_next_sibling()
+        if detail is None and heading.parent.name == 'div':
+            detail = heading.parent.find_next_sibling()
         if detail:
             value = value_of(detail)
             if value:
@@ -194,12 +248,21 @@ def parse_venue(html: str) -> str | None:
 
 def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
     """Extract ticket rows from Gakuen, SideM and Shiny's known layouts."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _page_soup(html)
     parsed = ParsedPage()
     seen: set[str] = set()
     # These are the field-owning units in the three documented page designs.
     # Do not traverse broad page sections: repeated dt labels would overwrite one another.
-    containers = soup.select("section.p-ticket__group, details, dl.ticketList, dl.c-dl, .ticketCol > dl")
+    containers = soup.select("section.p-ticket__group, details, dl.ticketList, div.ticketList, dl.c-dl, .ticketCol > dl")
+    # New official pages use unclassed dl or c-detail-list/c-table-list-a.
+    # A single reception owns one application-period field; never flatten an
+    # outer accordion containing several receptions into one set of dates.
+    for node in soup.find_all('dl'):
+        periods = [dt for dt in node.find_all('dt')
+                   if any(label in clean(dt.get_text(' ')) for label in ('受付期間', '申込期間', '販売期間'))]
+        if len(periods) == 1 and periods[0].find_parent('dl') is node:
+            if not node.find_parent('div', class_='ticketList'):
+                containers.append(node)
     # Small Gakuen sections and SideM accordions carry fields in one container.
     for node in containers:
         # Outer accordion/section wrappers can contain several separate
@@ -224,13 +287,10 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         start, end = _range(period)
         result = japan_datetime(_field(pairs, "当落発表", "結果発表") or "")
         pay_start, pay_end = _range(_field(pairs, "入金期間", "支払期間"))
-        url = next((item for item in links if "ticket" in item or "asobi" in item or "eplus" in item or "l-tike" in item), None)
+        urls = list(dict.fromkeys(item for item in links if 'asobiticket' in item and '/receptions/' in item))
+        if not urls:
+            urls = [next((item for item in links if "ticket" in item or "asobi" in item or "eplus" in item or "l-tike" in item), None)]
         evidence = Evidence(source_url, whole[:400], "ticket-html")
-        # Dates and update badges must never change a reception's identity.
-        key = stable(url) if url else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
-        if key in seen:
-            continue
-        seen.add(key)
         if period and (start is None or end is None):
             parsed.review_notes.append(f"票务期限无法完整解析：{title}｜{period}")
         eligibility = _field(pairs, "対象者", "対象会員", "資格")
@@ -238,14 +298,29 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
             notes = [clean(item.get_text(" ")) for item in node.select("li")]
             membership_notes = [note for note in notes if "会員" in note]
             eligibility = " ".join(membership_notes) or None
-        parsed.ticket_rounds.append(TicketRound(
-            stable_key=key, name=title, ticket_scope=scope,
-            sale_method=_method(title + " " + whole[:300]),
-            application_start=start, application_end=end, result_at=result,
-            payment_start=pay_start, payment_end=pay_end, url=url,
-            seats=_field(pairs, "対象席種", "券種", "チケット料金"),
-            eligibility=eligibility, evidence=evidence,
-        ))
+        for url in urls:
+            # Distinct official reception links (e.g. VIP and normal seats)
+            # must survive; date edits never change their identities.
+            key = stable(url) if url else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
+            if key in seen:
+                continue
+            seen.add(key)
+            link_label = ''
+            if len(urls) > 1:
+                anchor = next((a for a in node.select('a[href]') if urljoin(source_url, a['href']) == url), None)
+                if anchor:
+                    link_label = clean(anchor.get_text(' '))
+                    if link_label.startswith('http'):
+                        seat_heading = anchor.parent.find_previous_sibling(['p', 'h3', 'h4'])
+                        link_label = clean(seat_heading.get_text(' ')) if seat_heading else ''
+            parsed.ticket_rounds.append(TicketRound(
+                stable_key=key, name=title + ('｜' + link_label if link_label else ''), ticket_scope=scope,
+                sale_method=_method(title + " " + whole[:300]),
+                application_start=start, application_end=end, result_at=result,
+                payment_start=pay_start, payment_end=pay_end, url=url,
+                seats=_field(pairs, "対象席種", "券種", "チケット料金"),
+                eligibility=eligibility, evidence=evidence,
+            ))
     if not parsed.ticket_rounds:
         parsed.review_notes.append("未找到可验证的票务字段；页面已保留为待核验来源。")
     return parsed
@@ -255,6 +330,7 @@ def schedule_performances(text: str, source_url: str, venue: str | None = None,
                           directory: bool = False) -> list[Performance]:
     """Read explicit dates only; continuous ranges are never expanded into sessions."""
     normalized = unicodedata.normalize('NFKC', text or '')
+    normalized = re.sub(r'(?<=\d)\s+(?=[年月日])|(?<=[年月])\s+(?=\d)', '', normalized)
     if re.search(r'\d日?\s*(?:\([^)]*\))?\s*[~〜～－–]', normalized):
         return []
     # Resolve same-month enumerations, e.g. 9月12日(土)・13日(日).
@@ -295,7 +371,7 @@ def schedule_performances(text: str, source_url: str, venue: str | None = None,
 
 
 def parse_information(html: str, source_url: str) -> list[Performance]:
-    soup = BeautifulSoup(html, 'html.parser')
+    soup = _page_soup(html)
     labels = {'公演日時', '開催日時', '日程', '公演日程', '日時', '開催日'}
     for node in soup.find_all(['dt', 'h2', 'h3', 'h4']):
         label = re.sub(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s*Update', '', clean(node.get_text(' '))).strip()
@@ -307,8 +383,13 @@ def parse_information(html: str, source_url: str) -> list[Performance]:
             if block:
                 blocks.append(block)
         else:
-            for block in node.find_next_siblings():
+            anchor = node
+            if node.find_next_sibling() is None and node.parent.name == 'div':
+                anchor = node.parent
+            for block in anchor.find_next_siblings():
                 if block.name == 'dt' or (block.name in {'h1', 'h2', 'h3', 'h4'} and int(block.name[1]) <= int(node.name[1])):
+                    break
+                if any(int(h.name[1]) <= int(node.name[1]) for h in block.find_all(['h1', 'h2', 'h3', 'h4'])):
                     break
                 blocks.append(block)
         if blocks:

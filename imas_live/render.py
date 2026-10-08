@@ -102,7 +102,8 @@ class CalendarRenderer:
         draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         color, label, _ = self._brand_style(entry["brands"])
         width = self.width - 180
-        labels = self._wrap(draw, label, self.font(20, True), width - 270)
+        badge_width = draw.textlength(entry.get('status_label', ''), font=self.font(20, True)) + 64
+        labels = self._wrap(draw, label, self.font(20, True), max(120, width - max(270, badge_width)))
         number = entry.get("public_number")
         numbered_title = f"#{number} · {entry['title']}" if number else entry["title"]
         title = self._wrap(draw, numbered_title, self.font(28, True), width)
@@ -114,6 +115,7 @@ class CalendarRenderer:
                  "upcoming": ("#f4f6f8", "#d6dce3", "#657187"),
                  "unknown": ("#f4f6f8", "#d6dce3", "#657187"),
                  "stale": ("#f4f6f8", "#d6dce3", "#657187")}
+        fills['ended'] = fills['upcoming']
         fill, outline, badge_color = fills.get(ticket_status, ("#fff3f3" if deadline else "white", "#e4b4be" if deadline else "#e3e8f1", "#b93863"))
         subtitle = entry["subtitle"]
         if reminder:
@@ -216,26 +218,29 @@ class CalendarRenderer:
 
     def render_ticket(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime,
                       status: str = "", data_updated_at: datetime | None = None) -> Path:
-        cards = [self._card_layout(entry) for entry in entries]
-        header_height = 204
-        height = max(620, header_height + 36 + sum(card['height'] + 18 for card in cards) + 64)
+        cards = [(entry.get('event_id', entry['title']), entry, self._card_layout(entry)) for entry in entries]
+        header_height = 112
+        height = max(620, header_height + 36 + sum(card['height'] + 18 +
+            (54 if i == 0 or cards[i-1][0] != group else 0)
+            for i, (group, _, card) in enumerate(cards)) + 64)
         image = Image.new('RGB', (self.width, height), '#f5f7fb')
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, header_height), fill='#172033')
-        draw.text((48, 28), 'Current Lotteries', font=self.font(42, True), fill='white')
-        draw.text((48, 90), '正在开放的已核验现场抽选', font=self.font(26), fill='#c8d3e6')
-        zone = '北京时间' if str(generated_at.tzinfo) == 'Asia/Shanghai' else str(generated_at.tzinfo)
-        draw.text((48, 136), f'{zone} {start:%Y.%m.%d} — {(end - timedelta(days=1)):%Y.%m.%d}', font=self.font(22), fill='#c8d3e6')
+        draw.text((48, 28), 'Ticket Lotteries', font=self.font(42, True), fill='white')
         y = header_height + 28
         if not cards:
             if '尚未同步' in status:
                 message = '数据尚未同步完成，请稍后再发送 /imasticket。'
-            elif '当前开放轮次的专题缓存待复核' in status or '复核失败' in status:
-                message = '暂未能核验当前开放轮次；请查看底部复核状态。'
             else:
-                message = '近期暂无已核验的现场抽选。'
+                message = '暂无已收录的现场抽选。'
             draw.text((48, y + 48), message, font=self.font(30, True), fill='#25324a')
-        for card in cards:
+        previous_group = None
+        for group, entry, card in cards:
+            if group != previous_group:
+                number = entry.get('public_number')
+                draw.text((48, y + 8), f"#{number}" if number else 'Ticket Rounds', font=self.font(26, True), fill='#263651')
+                y += 54
+            previous_group = group
             self._draw_card(draw, card, y)
             y += card['height'] + 18
         draw.text((48, height - 34), self._footer_update_time(data_updated_at), font=self.font(18), fill='#657187')
