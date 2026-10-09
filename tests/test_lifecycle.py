@@ -103,7 +103,11 @@ class _FilterHarness:
                 bound.append(parameter.default)
             else:
                 return "parameter_error"
-        return [result async for result in entry.handler(plugin, event, *bound)]
+        pending = entry.handler(plugin, event, *bound)
+        if inspect.isasyncgen(pending):
+            return [result async for result in pending]
+        await pending
+        return []
 
 
 def plugin_module():
@@ -113,7 +117,10 @@ def plugin_module():
     modules['astrbot.api'].AstrBotConfig = dict
     modules['astrbot.api'].logger = Mock()
     modules['astrbot.api.event'].AstrMessageEvent = object
-    modules['astrbot.api.event'].MessageChain = Mock()
+    class Chain:
+        def __init__(self, chain):
+            self.chain = chain
+    modules['astrbot.api.event'].MessageChain = Chain
     command_filter = _FilterHarness()
     modules['astrbot.api.event'].filter = command_filter
     modules['astrbot.api.star'].Context = object
@@ -154,12 +161,14 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             event.stop_event.return_value = None
             event.plain_result.side_effect = lambda text: ('text', text)
             event.chain_result.side_effect = lambda chain: ('chain', chain)
+            event.send = AsyncMock()
             async def idle():
                 await asyncio.Event().wait()
             plugin._sync_loop, plugin._reminder_loop = idle, idle
             responses = await asyncio.wait_for(module._test_filter.dispatch(plugin, 'imaslive 10', event), timeout=3)
-            self.assertEqual([item[0] for item in responses], ['text', 'chain', 'text'])
-            self.assertIn('/imasticket get <编号>', responses[-1][1])
+            self.assertEqual(responses, [])
+            self.assertEqual(event.send.await_count, 3)
+            self.assertIn('/imasticket get <编号>', event.send.await_args.args[0].chain[0].text)
             await plugin.terminate()
 
     async def test_first_directory_failure_returns_status_without_long_wait(self):
@@ -179,9 +188,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             event.stop_event.return_value = None
             event.plain_result.side_effect = lambda text: ('text', text)
             event.chain_result.side_effect = lambda chain: ('chain', chain)
+            event.send = AsyncMock()
             responses = await asyncio.wait_for(module._test_filter.dispatch(plugin, 'imaslive', event), timeout=3)
-            self.assertEqual([item[0] for item in responses], ['text', 'text', 'chain'])
-            self.assertIn('尚未成功', responses[1][1])
+            self.assertEqual(responses, [])
+            self.assertEqual(event.send.await_count, 3)
+            self.assertIn('尚未成功', event.send.await_args_list[1].args[0][1])
             await plugin.terminate()
 
     async def test_live_loads_without_flight_modules_or_dependency_and_preserves_old_database(self):
@@ -236,10 +247,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             plugin._wait_for_first_directory = already_ready
             event = Mock()
             event.chain_result.side_effect = lambda chain: ("chain", chain)
+            event.send = AsyncMock()
             responses = await module._test_filter.dispatch(plugin, "imasticket get 2", event)
 
         plugin.service.ticket_detail.assert_awaited_once_with(2)
-        self.assertEqual([response[0] for response in responses], ["chain"])
+        self.assertEqual(responses, [])
+        self.assertEqual(event.send.await_args.args[0][0], 'chain')
 
     async def test_native_commands_have_no_duplicate_roots_and_keep_admin_filters(self):
         module = plugin_module()
@@ -263,11 +276,13 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         event = Mock()
         event.unified_msg_origin = "test:GroupMessage:42"
         event.plain_result.side_effect = lambda text: ("text", text)
+        event.send = AsyncMock()
         self.assertEqual(await module._test_filter.dispatch(plugin, "imaslive enable", event, is_admin=False), "permission_denied")
         plugin.service.set_subscription.assert_not_called()
 
         allowed = await module._test_filter.dispatch(plugin, "imaslive enable", event, is_admin=True)
-        self.assertEqual(allowed[0][0], "text")
+        self.assertEqual(allowed, [])
+        self.assertEqual(event.send.await_args.args[0][0], 'text')
         plugin.service.set_subscription.assert_called_once_with("live", "test:GroupMessage:42", True)
 
         # Disabling the native command leaves no parameter-dispatch write path.
@@ -308,8 +323,10 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             event.plain_result.side_effect = lambda text: ('text', text)
             event.image_result.side_effect = lambda path: ('image', path)
             event.chain_result.side_effect = lambda chain: ('chain', chain)
+            event.send = AsyncMock()
             responses = await module._test_filter.dispatch(plugin, "imaslive", event)
-            self.assertEqual([result[0] for result in responses], ['text', 'chain'])
+            self.assertEqual(responses, [])
+            self.assertEqual(event.send.await_count, 2)
             self.assertTrue(plugin.service.directory_ready.is_set())
             running = (plugin._sync_task, plugin._reminder_task)
             await plugin.initialize()

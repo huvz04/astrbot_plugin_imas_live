@@ -714,6 +714,11 @@ class ImasLiveService:
                             "ticket_id": row['id'], "round_name": row['name'], "seats": row.get('seats'),
                             "application_start": row.get('application_start'), "application_end": row.get('application_end'),
                             "application_url": row.get('url'),
+                            # Overview is event-level, not limited to the city
+                            # targeted by this particular reception.
+                            "performance_dates": dates, "performance_venues": venues,
+                            "event_performance_dates": sorted({p['date'] for p in event_performances if p.get('date')}),
+                            "event_performance_venues": list(dict.fromkeys(clean(p['venue']) for p in event_performances if p.get('venue'))),
                             "live_start": live_start,
                             "sort_time": deadline or datetime.max.replace(tzinfo=timezone.utc),
                             "source_fetched_at": row.get("source_fetched_at")})

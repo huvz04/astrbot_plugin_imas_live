@@ -1,5 +1,6 @@
 """Overview-first, one native Nodes container, and cached query-window details."""
 import tempfile
+import inspect
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -102,6 +103,26 @@ class ChainContract:
         self.chain = chain
 
 
+async def stopped_pipeline(event, handler, *args):
+    """Essential v4.27.2/3 call_handler -> _process_stages boundary.
+
+    Official sources: astrbot/core/pipeline/context_utils.py and
+    astrbot/core/pipeline/scheduler.py at tag v4.27.3. The wrapper yields
+    after EACH generator result, but only AFTER a coroutine completes.
+    The scheduler breaks on the first wrapper yield when stopped.
+    """
+    async def call_handler():
+        pending = handler(event, *args)
+        if inspect.isasyncgen(pending):
+            async for result in pending:
+                yield result
+        else:
+            yield await pending
+    async for _ in call_handler():
+        if event.is_stopped():
+            break
+
+
 class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.module = plugin_module()
@@ -119,7 +140,7 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
         self.image = Path(self.temp.name)/'overview.png'
         self.image.touch()
         self.plugin.renderer = Mock()
-        self.plugin.renderer.render_ticket.return_value = self.image
+        self.plugin.renderer.render_ticket_overview.return_value = self.image
         self.plugin.renderer.render_calendar.return_value = [self.image]
         async def ready(_event):
             if False:
@@ -132,22 +153,25 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
         self.event.chain_result.side_effect = lambda chain: ('chain', chain)
         self.event.plain_result.side_effect = lambda text: ('text', text)
         self.event.send = AsyncMock()
+        self.stopped = False
+        def stop():
+            self.stopped = True
+        self.event.stop_event.side_effect = stop
+        self.event.is_stopped.side_effect = lambda: self.stopped
 
     async def asyncTearDown(self):
         self.temp.cleanup()
 
-    async def test_overview_yields_before_one_nodes_container_in_group_and_private(self):
+    async def test_overview_sends_before_one_nodes_container_in_group_and_private(self):
         for origin in ['qq:GroupMessage:42', 'qq:FriendMessage:43']:
             with self.subTest(origin=origin):
                 self.event.unified_msg_origin = origin
                 self.event.send.reset_mock()
-                generator = self.plugin.imasticket(self.event)
-                image = await anext(generator)
-                self.assertEqual(image[0], 'chain')
-                self.assertEqual(len(image[1]), 1)  # no external Plain URL list
-                self.event.send.assert_not_awaited()
-                with self.assertRaises(StopAsyncIteration):
-                    await anext(generator)
+                self.assertTrue(inspect.iscoroutinefunction(self.plugin.imasticket))
+                await self.plugin.imasticket(self.event)
+                image = self.event.send.await_args_list[0].args[0]
+                self.assertEqual(len(image.chain), 1)  # no external Plain URL list
+                self.assertEqual(image.chain[0][0], 'image')
                 chain = self.event.send.await_args.args[0]
                 self.assertEqual(len(chain.chain), 1)
                 container = chain.chain[0]
@@ -155,23 +179,23 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(container.nodes), 2)
                 self.assertEqual([n.content[0].text for n in container.nodes], ['#7 a\nSP / normal', '#8 b'])
                 self.assertTrue(all(n.uin == '12345678' and n.name == 'IM@S LIVE' for n in container.nodes))
-                self.event.send.assert_awaited_once()
+                self.assertEqual(self.event.send.await_count, 2)
 
     async def test_live_month_also_sends_once_after_image(self):
-        responses = [r async for r in self.plugin.imaslive(self.event, '10')]
-        self.assertEqual([r[0] for r in responses], ['chain'])
+        await self.plugin.imaslive(self.event, '10')
         self.plugin.service.calendar_entries.assert_awaited_once_with(month=10)
         self.plugin.service.query_detail_texts.assert_awaited_once_with(self.entries, 'live')
-        self.event.send.assert_awaited_once()
+        self.assertEqual(self.event.send.await_count, 2)
+        self.assertEqual(self.event.send.await_args_list[0].args[0].chain[0][0], 'image')
+        self.assertIsInstance(self.event.send.await_args.args[0].chain[0], NodesContract)
 
     async def test_failed_forward_keeps_image_and_short_index_without_long_urls(self):
         for failure in [RuntimeError('adapter does not support forwarding'), False]:
             self.event.send.reset_mock()
-            self.event.send.side_effect = failure if isinstance(failure, Exception) else None
-            self.event.send.return_value = failure
-            responses = [r async for r in self.plugin.imasticket(self.event)]
-            self.assertEqual([r[0] for r in responses], ['chain', 'text'])
-            fallback = responses[1][1]
+            self.event.send.side_effect = [None, failure, None]
+            await self.plugin.imasticket(self.event)
+            self.assertEqual(self.event.send.await_count, 3)
+            fallback = self.event.send.await_args.args[0].chain[0].text
             self.assertIn('#7', fallback)
             self.assertIn('/imasticket get <编号>', fallback)
             self.assertNotIn('https://', fallback)
@@ -179,18 +203,19 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
 
     async def test_unsupported_platform_or_missing_self_id_does_not_send_forward(self):
         for platform, self_id in [('telegram', '12345678'), ('aiocqhttp', None)]:
+            self.event.send.reset_mock()
             self.event.get_platform_name.return_value = platform
             self.event.get_self_id.return_value = self_id
-            responses = [r async for r in self.plugin.imasticket(self.event)]
-            self.assertEqual([r[0] for r in responses], ['chain', 'text'])
-        self.event.send.assert_not_awaited()
+            await self.plugin.imasticket(self.event)
+            self.assertEqual(self.event.send.await_count, 2)
+            self.assertIn('活动索引', self.event.send.await_args.args[0].chain[0].text)
         self.plugin.service.query_detail_texts.assert_not_awaited()
 
     async def test_empty_result_only_emits_image_and_index_is_bounded(self):
         self.plugin.service.ticket_entries.return_value = ([], NOW, NOW, '')
-        responses = [r async for r in self.plugin.imasticket(self.event)]
-        self.assertEqual([r[0] for r in responses], ['chain'])
-        self.event.send.assert_not_awaited()
+        await self.plugin.imasticket(self.event)
+        self.event.send.assert_awaited_once()
+        self.assertEqual(self.event.send.await_args.args[0].chain[0][0], 'image')
         self.plugin.service.query_detail_texts.assert_not_awaited()
         index = self.plugin._query_index([{'event_id': str(i), 'public_number': i, 'title': 'x'*100} for i in range(40)])
         self.assertLess(len(index), 800)
@@ -198,11 +223,81 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
 
     async def test_forward_format_error_is_separate_from_image_and_render_error_never_forwards(self):
         self.plugin.service.query_detail_texts.side_effect = ValueError('bad cache')
-        responses = [r async for r in self.plugin.imasticket(self.event)]
-        self.assertEqual([r[0] for r in responses], ['chain', 'text'])
-        self.assertNotIn('图片生成失败', responses[1][1])
-        self.event.send.assert_not_awaited()
-        self.plugin.renderer.render_ticket.side_effect = ValueError('font')
-        responses = [r async for r in self.plugin.imasticket(self.event)]
-        self.assertEqual([r[0] for r in responses], ['text'])
-        self.assertIn('图片生成失败', responses[0][1])
+        await self.plugin.imasticket(self.event)
+        self.assertEqual(self.event.send.await_count, 2)
+        self.assertNotIn('图片生成失败', self.event.send.await_args.args[0].chain[0].text)
+        self.event.send.reset_mock()
+        self.plugin.service.query_detail_texts.reset_mock()
+        self.plugin.renderer.render_ticket_overview.side_effect = ValueError('font')
+        await self.plugin.imasticket(self.event)
+        self.event.send.assert_awaited_once()
+        self.assertIn('图片生成失败', self.event.send.await_args.args[0][1])
+        self.plugin.service.query_detail_texts.assert_not_awaited()
+
+    async def test_failed_image_never_sends_or_formats_forward(self):
+        for failure in [RuntimeError('image failed'), False]:
+            self.event.send.reset_mock()
+            self.event.send.side_effect = [failure]
+            await self.plugin.imasticket(self.event)
+            self.event.send.assert_awaited_once()
+            self.plugin.service.query_detail_texts.assert_not_awaited()
+
+    async def test_legacy_first_yield_reproduces_missing_forward(self):
+        forward = AsyncMock()
+        async def legacy(event):
+            event.stop_event()
+            yield 'overview'
+            await forward()
+        await stopped_pipeline(self.event, legacy)
+        self.assertTrue(self.stopped)
+        forward.assert_not_awaited()
+
+    async def test_stopped_scheduler_completes_both_queries_and_first_sync_warnings(self):
+        for command, args in [('imaslive', ('10',)), ('imasticket', ())]:
+            for first_sync in [False, True]:
+                with self.subTest(command=command, first_sync=first_sync):
+                    self.event.send.reset_mock()
+                    async def ready(event):
+                        if first_sync:
+                            yield event.plain_result('首次同步中')
+                            yield event.plain_result('官网暂不可用，使用缓存')
+                    self.plugin._wait_for_first_directory = ready
+                    await stopped_pipeline(self.event, getattr(self.plugin, command), *args)
+                    sent = [c.args[0] for c in self.event.send.await_args_list]
+                    self.assertEqual(len(sent), 4 if first_sync else 2)
+                    self.assertEqual(sent[-2].chain[0][0], 'image')
+                    self.assertIsInstance(sent[-1].chain[0], NodesContract)
+                    if first_sync:
+                        self.assertEqual([c[0] for c in sent[:2]], ['text', 'text'])
+
+    async def test_get_next_and_admin_responses_complete_with_stopped_event(self):
+        self.plugin.renderer.render_ticket.return_value = self.image
+        self.plugin.service.ticket_detail = AsyncMock(return_value={
+            'event': {'official_url': ROOT}, 'tickets': self.entries, 'cast': []})
+        self.plugin.service.next_entry = AsyncMock(return_value={
+            **self.entries[0], 'official_url': ROOT, 'cast': []})
+        self.event.unified_msg_origin = 'qq:GroupMessage:42'
+        cases = [('imasticket_get', (7,)), ('imaslive_next', ()),
+                 ('imaslive_enable', ()), ('imaslive_disable', ()),
+                 ('imasticket_enable', ()), ('imasticket_disable', ())]
+        for command, args in cases:
+            with self.subTest(command=command):
+                self.event.send.reset_mock()
+                handler = getattr(self.plugin, command)
+                self.assertTrue(inspect.iscoroutinefunction(handler))
+                await stopped_pipeline(self.event, handler, *args)
+                self.event.send.assert_awaited_once()
+                self.assertTrue(self.stopped)
+        self.assertEqual(self.plugin.service.set_subscription.call_args_list,
+            [unittest.mock.call('live', 'qq:GroupMessage:42', True),
+             unittest.mock.call('live', 'qq:GroupMessage:42', False),
+             unittest.mock.call('ticket', 'qq:GroupMessage:42', True),
+             unittest.mock.call('ticket', 'qq:GroupMessage:42', False)])
+
+    async def test_usage_errors_directly_reply_with_stopped_event(self):
+        for command, args in [('imaslive', ('13',)), ('imasticket', ('wrong',)),
+                              ('imaslive_next', ('cg', 'extra')), ('imasticket_get', (0,))]:
+            self.event.send.reset_mock()
+            await stopped_pipeline(self.event, getattr(self.plugin, command), *args)
+            self.event.send.assert_awaited_once()
+            self.assertIn('用法', self.event.send.await_args.args[0][1])

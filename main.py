@@ -211,22 +211,47 @@ class ImasLivePlugin(Star):
         """Send one native forward after the overview; failure cannot undo the image."""
         if not entries:
             return None
+        platform, node_count = 'unknown', 0
         try:
-            if event.get_platform_name() != 'aiocqhttp' or Node is None or Nodes is None:
+            platform = event.get_platform_name()
+            if platform != 'aiocqhttp' or Node is None or Nodes is None:
+                logger.info('IM@S query forward: kind=%s platform=%s nodes=0 result=unsupported', kind, platform)
                 return self._query_index(entries)
             self_id = str(event.get_self_id() or '')
             if not self_id.isdigit() or int(self_id) == 0:
+                logger.warning('IM@S query forward: kind=%s platform=%s nodes=0 result=missing_bot_identity', kind, platform)
                 return self._query_index(entries)
             texts = await self.service.query_detail_texts(entries, kind)
             nodes = [Node(uin=self_id, name='IM@S LIVE', content=[Plain(text)]) for text in texts]
+            node_count = len(nodes)
             if nodes:
                 sent = await event.send(MessageChain([Nodes(nodes=nodes)]))
                 if sent is False:
                     raise RuntimeError('adapter reported a failed forward send')
+                logger.info('IM@S query forward: kind=%s platform=%s nodes=%s result=send_completed', kind, platform, node_count)
             return None
         except Exception:
-            logger.exception('IM@S query detail forward failed: kind=%s', kind)
+            logger.exception('IM@S query forward: kind=%s platform=%s nodes=%s result=failed', kind, platform, node_count)
             return self._query_index(entries)
+
+    async def _deliver_query_overview(self, event: AstrMessageEvent, images: list[Path], entries: list[dict], kind: str) -> None:
+        """Finish all sends inside this coroutine, before the scheduler observes stop_event."""
+        try:
+            for image in images:
+                if not image.is_file():
+                    raise FileNotFoundError(image)
+                sent = await event.send(MessageChain([Image.fromFileSystem(str(image))]))
+                if sent is False:
+                    raise RuntimeError('adapter reported a failed overview send')
+        except Exception:
+            logger.exception('IM@S query overview send failed: kind=%s', kind)
+            return
+        fallback = await self._send_query_details(event, entries, kind)
+        if fallback:
+            try:
+                await event.send(MessageChain([Plain(fallback)]))
+            except Exception:
+                logger.exception('IM@S query fallback index send failed: kind=%s', kind)
 
     async def _wait_for_first_directory(self, event: AstrMessageEvent) -> None:
         await self.initialize()
@@ -253,48 +278,44 @@ class ImasLivePlugin(Star):
             try:
                 month = parse_live_month(" ".join(part for part in (month_argument, extra_argument) if part))
             except ValueError:
-                yield event.plain_result('用法：/imaslive、/imaslive 1—12、/imaslive next [企划]、/imaslive enable|disable')
+                await event.send(event.plain_result('用法：/imaslive、/imaslive 1—12、/imaslive next [企划]、/imaslive enable|disable'))
                 return
             async for response in self._wait_for_first_directory(event):
-                yield response
+                await event.send(response)
             entries, start, end, status, title = await self.service.calendar_entries(month=month)
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
             images = await asyncio.to_thread(self.renderer.render_calendar, entries, start.date(), end.date(), now, status, title, self._data_updated_at(entries))
-            for image in images:
-                yield self._image_and_links(event, image, [])
         except Exception:
             logger.exception("IM@S calendar image rendering failed")
-            yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
+            await event.send(event.plain_result("日历图片生成失败；请检查插件字体配置和日志。"))
             return
-        fallback = await self._send_query_details(event, entries, 'live')
-        if fallback:
-            yield event.plain_result(fallback)
+        await self._deliver_query_overview(event, images, entries, 'live')
 
     @filter.command("imaslive next")
     async def imaslive_next(self, event: AstrMessageEvent, brand: str = "", extra_argument: str = ""):
         """显示下一场已收录 LIVE；可选 imas/cg/ml/sidem/sc/gk。"""
         event.stop_event()
         if extra_argument:
-            yield event.plain_result("用法：/imaslive next [imas/cg/ml/sidem/sc/gk]")
+            await event.send(event.plain_result("用法：/imaslive next [imas/cg/ml/sidem/sc/gk]"))
             return
         try:
             async for response in self._wait_for_first_directory(event):
-                yield response
+                await event.send(response)
             try:
                 entry = await self.service.next_entry(brand)
             except ValueError:
-                yield event.plain_result("未知企划。可用：imas、cg、ml、sidem、sc、gk。")
+                await event.send(event.plain_result("未知企划。可用：imas、cg、ml、sidem、sc、gk。"))
                 return
             if not entry:
-                yield event.plain_result("没有找到尚未开始的已收录公演。")
+                await event.send(event.plain_result("没有找到尚未开始的已收录公演。"))
                 return
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
             image = await asyncio.to_thread(self.renderer.render_calendar, [entry], now.date(), now.date(), now, "官网资料以链接为准", "IM@S LIVE! · Next Performance", self._data_updated_at([entry]))
             links = [self._cast_text(entry["cast"]), f"官方活动页：{entry['official_url'] or entry['url']}"]
-            yield self._image_and_links(event, image[0], links, entry.get("cast_assets"))
+            await event.send(self._image_and_links(event, image[0], links, entry.get("cast_assets")))
         except Exception:
             logger.exception("IM@S next live image rendering failed")
-            yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
+            await event.send(event.plain_result("日历图片生成失败；请检查插件字体配置和日志。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imaslive enable")
@@ -302,14 +323,14 @@ class ImasLivePlugin(Star):
         """管理员：开启本群 LIVE 开演提醒与新增现场抽选公告。"""
         event.stop_event()
         if extra_argument:
-            yield event.plain_result("用法：/imaslive enable")
+            await event.send(event.plain_result("用法：/imaslive enable"))
             return
         umo = self._group_umo(event)
         if not umo:
-            yield event.plain_result("LIVE 订阅只能在群内设置。")
+            await event.send(event.plain_result("LIVE 订阅只能在群内设置。"))
             return
         self.service.set_subscription("live", umo, True)
-        yield event.plain_result("已开启本群 LIVE 开演提醒与新增现场抽选公告。")
+        await event.send(event.plain_result("已开启本群 LIVE 开演提醒与新增现场抽选公告。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imaslive disable")
@@ -317,14 +338,14 @@ class ImasLivePlugin(Star):
         """管理员：关闭本群 LIVE 开演提醒与新增现场抽选公告。"""
         event.stop_event()
         if extra_argument:
-            yield event.plain_result("用法：/imaslive disable")
+            await event.send(event.plain_result("用法：/imaslive disable"))
             return
         umo = self._group_umo(event)
         if not umo:
-            yield event.plain_result("LIVE 订阅只能在群内设置。")
+            await event.send(event.plain_result("LIVE 订阅只能在群内设置。"))
             return
         self.service.set_subscription("live", umo, False)
-        yield event.plain_result("已关闭本群 LIVE 开演提醒与新增现场抽选公告。")
+        await event.send(event.plain_result("已关闭本群 LIVE 开演提醒与新增现场抽选公告。"))
 
     @filter.command("imasticket")
     async def imasticket(self, event: AstrMessageEvent, action: str = "", extra_argument: str = ""):
@@ -333,49 +354,46 @@ class ImasLivePlugin(Star):
             return
         event.stop_event()
         if action or extra_argument:
-            yield event.plain_result("用法：/imasticket、/imasticket get <活动编号>、/imasticket enable|disable")
+            await event.send(event.plain_result("用法：/imasticket、/imasticket get <活动编号>、/imasticket enable|disable"))
             return
         try:
             async for response in self._wait_for_first_directory(event):
-                yield response
+                await event.send(response)
             refresh = await self.service.refresh_open_ticket_sources()
             entries, start, end, status = await self.service.ticket_entries()
             if refresh["failed"]:
                 status += f"｜{refresh['failed']} 个专题复核失败，保留上次记录并标记待核验"
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
-            image = await asyncio.to_thread(self.renderer.render_ticket, entries, start.date(), end.date(), now, status, self._data_updated_at(entries))
-            yield self._image_and_links(event, image, [])
+            image = await asyncio.to_thread(self.renderer.render_ticket_overview, entries, start.date(), end.date(), now, status, self._data_updated_at(entries))
         except Exception:
             logger.exception("IM@S ticket image rendering failed")
-            yield event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。")
+            await event.send(event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。"))
             return
-        fallback = await self._send_query_details(event, entries, 'ticket')
-        if fallback:
-            yield event.plain_result(fallback)
+        await self._deliver_query_overview(event, [image], entries, 'ticket')
 
     @filter.command("imasticket get")
     async def imasticket_get(self, event: AstrMessageEvent, ticket_number: int, extra_argument: str = ""):
         """按活动编号查看已收录的历史现场票务。"""
         event.stop_event()
         if ticket_number < 1 or extra_argument:
-            yield event.plain_result("用法：/imasticket get <活动编号>，例如 /imasticket get 1。")
+            await event.send(event.plain_result("用法：/imasticket get <活动编号>，例如 /imasticket get 1。"))
             return
         try:
             async for response in self._wait_for_first_directory(event):
-                yield response
+                await event.send(response)
             detail = await self.service.ticket_detail(ticket_number)
             if not detail:
-                yield event.plain_result("没有这个活动编号；请使用 LIVE 或抽票图中的 #编号。")
+                await event.send(event.plain_result("没有这个活动编号；请使用 LIVE 或抽票图中的 #编号。"))
                 return
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
             image = await asyncio.to_thread(self.renderer.render_ticket, detail["tickets"], now.date(), now.date(), now, "历史票务状态以官方页为准", self._data_updated_at(detail["tickets"]))
             urls = [f"官方活动页：{detail['event'].get('official_url')}"]
             urls.extend(f"官方票务页：{row['url']}" for row in detail["tickets"] if row.get("url"))
             urls.append(self._cast_text(detail["cast"]))
-            yield self._image_and_links(event, image, list(dict.fromkeys(urls)))
+            await event.send(self._image_and_links(event, image, list(dict.fromkeys(urls))))
         except Exception:
             logger.exception("IM@S historical ticket image rendering failed")
-            yield event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。")
+            await event.send(event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasticket enable")
@@ -383,14 +401,14 @@ class ImasLivePlugin(Star):
         """管理员：开启本群抽票截止提醒。"""
         event.stop_event()
         if extra_argument:
-            yield event.plain_result("用法：/imasticket enable")
+            await event.send(event.plain_result("用法：/imasticket enable"))
             return
         umo = self._group_umo(event)
         if not umo:
-            yield event.plain_result("抽票截止提醒只能在群内设置。")
+            await event.send(event.plain_result("抽票截止提醒只能在群内设置。"))
             return
         self.service.set_subscription("ticket", umo, True)
-        yield event.plain_result("已开启本群抽票截止提醒（截止前 24 小时和 1 小时各一次）。")
+        await event.send(event.plain_result("已开启本群抽票截止提醒（截止前 24 小时和 1 小时各一次）。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasticket disable")
@@ -398,14 +416,14 @@ class ImasLivePlugin(Star):
         """管理员：关闭本群抽票截止提醒。"""
         event.stop_event()
         if extra_argument:
-            yield event.plain_result("用法：/imasticket disable")
+            await event.send(event.plain_result("用法：/imasticket disable"))
             return
         umo = self._group_umo(event)
         if not umo:
-            yield event.plain_result("抽票截止提醒只能在群内设置。")
+            await event.send(event.plain_result("抽票截止提醒只能在群内设置。"))
             return
         self.service.set_subscription("ticket", umo, False)
-        yield event.plain_result("已关闭本群抽票截止提醒。")
+        await event.send(event.plain_result("已关闭本群抽票截止提醒。"))
 
     async def terminate(self):
         for task in (self._sync_task, self._reminder_task):

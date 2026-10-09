@@ -246,6 +246,56 @@ class CalendarRenderer:
         draw.text((48, height - 34), self._footer_update_time(data_updated_at), font=self.font(18), fill='#657187')
         return self._save(image, 'ticket')
 
+    @staticmethod
+    def ticket_overview_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in entries:
+            groups.setdefault(row['event_id'], []).append(row)
+        overview = []
+        for event_id, group in groups.items():
+            first = group[0]
+            dates = sorted({d for row in group for d in row.get('event_performance_dates', row.get('performance_dates', []))})
+            venues = list(dict.fromkeys(v for row in group for v in row.get('event_performance_venues', row.get('performance_venues', []))))
+            date_text = '～'.join(dict.fromkeys([dates[0], dates[-1]])).replace('-', '/') if dates else '日期待核验'
+            counts = dict.fromkeys(['open', 'urgent', 'upcoming', 'ended', 'unknown'], 0)
+            ended_pending = 0
+            for row in group:
+                state = row.get('ticket_status', 'unknown')
+                counts[state if state in counts else 'unknown'] += 1
+                ended_pending += int(state == 'ended' and '待核验' in row.get('status_label', ''))
+            summary = ' · '.join(f'{label} {counts[state]}' +
+                (f'（{ended_pending} 待核验）' if state == 'ended' and ended_pending else '')
+                for state, label in [('open', '进行'), ('urgent', '即将截止'), ('upcoming', '未开始'),
+                                     ('ended', '已结束'), ('unknown', '待核验')] if counts[state])
+            primary = next(state for state in ['urgent', 'open', 'upcoming', 'unknown', 'ended'] if counts[state])
+            labels = {'urgent': '含即将截止', 'open': '有进行中', 'upcoming': '尚未开始', 'unknown': '待核验', 'ended': '已结束'}
+            overview.append({'kind': 'ticket', 'event_id': event_id, 'public_number': first.get('public_number'),
+                'title': first['title'], 'brands': first['brands'],
+                'subtitle': f"演出：{date_text}\n场地：{'／'.join(venues) or '待核验'}\n{summary}",
+                'ticket_status': primary, 'status_label': f"{len(group)} 项 · {labels[primary]}",
+                'status_counts': counts, 'ended_pending': ended_pending,
+                'live_start': first.get('live_start') or (dates[0] if dates else '9999')})
+        return sorted(overview, key=lambda row: (str(row['live_start']), row['title'], row['event_id']))
+
+    def render_ticket_overview(self, entries: list[dict[str, Any]], start: date, end: date, generated_at: datetime,
+                               status: str = '', data_updated_at: datetime | None = None) -> Path:
+        """One card per event; full rounds remain in render_ticket for get/detail."""
+        cards = [self._card_layout(row) for row in self.ticket_overview_entries(entries)]
+        height = max(620, 112 + 28 + sum(card['height'] + 18 for card in cards) + 64)
+        image = Image.new('RGB', (self.width, height), '#f5f7fb')
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, self.width, 112), fill='#172033')
+        draw.text((48, 28), 'Ticket Overview', font=self.font(42, True), fill='white')
+        y = 140
+        if not cards:
+            message = '数据尚未同步完成，请稍后再发送 /imasticket。' if '尚未同步' in status else '暂无已收录的现场票务。'
+            draw.text((48, y+48), message, font=self.font(30, True), fill='#25324a')
+        for card in cards:
+            self._draw_card(draw, card, y)
+            y += card['height'] + 18
+        draw.text((48, height-34), self._footer_update_time(data_updated_at), font=self.font(18), fill='#657187')
+        return self._save(image, 'ticket')
+
     def render_reminder(self, rows: list[dict[str, Any]], generated_at: datetime,
                         heading: str = "IMAS 现场抽票即将截止", footer: str = "请核对官方申请页面",
                         show_remaining: bool = True) -> Path:

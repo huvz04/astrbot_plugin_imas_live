@@ -66,7 +66,7 @@ async def run():
             entries, start, end, status = await service.ticket_entries(current)
             renderer = CalendarRenderer(output)
             source_times = [datetime.fromisoformat(row['source_fetched_at']) for row in entries if row.get('source_fetched_at')]
-            image = renderer.render_ticket(entries, start.date(), end.date(), current, status, min(source_times, default=None))
+            image = renderer.render_ticket_overview(entries, start.date(), end.date(), current, status, min(source_times, default=None))
             clash_image = render_clash_sample(output, entries, current)
             counts = {}
             for item in entries:

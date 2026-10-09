@@ -151,6 +151,13 @@ class TicketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         entries, *_ = await self.service.ticket_entries(NOW)
         self.assertIn('長野ホール', entries[0]['subtitle'])
         self.assertNotIn('幕張ホール', entries[0]['subtitle'])
+        # The round detail keeps its own city binding; the event overview
+        # still represents every known city/session, not just this reception.
+        self.assertEqual(entries[0]['performance_dates'], ['2026-10-08', '2026-10-09'])
+        self.assertEqual(entries[0]['performance_venues'], ['長野ホール'])
+        self.assertEqual(entries[0]['event_performance_dates'],
+                         ['2026-10-08', '2026-10-09', '2026-12-26', '2026-12-27'])
+        self.assertEqual(set(entries[0]['event_performance_venues']), {'長野ホール', '幕張ホール'})
         self.assertEqual((await self.service.ticket_entries(NOW.replace(hour=16)))[0], [])
 
     async def test_upgrade_migrates_old_rounds_and_stale_active_round_never_notifies(self):
