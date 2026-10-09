@@ -226,7 +226,7 @@ class CalendarRenderer:
         image = Image.new('RGB', (self.width, height), '#f5f7fb')
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, self.width, header_height), fill='#172033')
-        draw.text((48, 28), 'Ticket Lotteries', font=self.font(42, True), fill='white')
+        draw.text((48, 28), 'Ticket Rounds', font=self.font(42, True), fill='white')
         y = header_height + 28
         if not cards:
             if '尚未同步' in status:

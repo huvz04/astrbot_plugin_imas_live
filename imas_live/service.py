@@ -12,6 +12,7 @@ import re
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict as vars_for_slots
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urldefrag
 from typing import Any
@@ -23,7 +24,7 @@ from PIL import Image
 
 from .cms import CmsArticle, OfficialCmsClient, SourceUnavailable, event_root
 from .database import Database
-from .parsing import parse_shiny_information, parse_day_cast, official_roster_image_urls, parse_ticket_page, parse_venue, parse_information, schedule_performances, clean
+from .parsing import parse_shiny_information, parse_day_cast, official_roster_image_urls, parse_ticket_page, parse_ticket_news, parse_venue, parse_information, schedule_performances, clean
 from .models import ParsedPage
 
 
@@ -214,7 +215,8 @@ class ImasLiveService:
                     continue
                 marker = 'news_seen:' + str(item.get('_id') or page)
                 revision = str(item.get('updated') or '')
-                if self.db.meta(marker) == revision:
+                ticket_marker = 'news_ticket_seen:' + str(item.get('_id') or page)
+                if self.db.meta(marker) == revision and self.db.meta(ticket_marker) == revision:
                     continue
                 if attempted >= 32:
                     break
@@ -225,6 +227,9 @@ class ImasLiveService:
                     errors.append(f'{page}: {exc}')
                     continue  # Leave the revision unacknowledged for a later retry.
                 soup = BeautifulSoup(html, 'html.parser')
+                roots = {event_root(urljoin('https://idolmaster-official.jp/news/' + page + '.html', anchor['href']))
+                         for anchor in soup.select('a[href]')}
+                roots.discard(None)
                 for anchor in soup.select('a[href]'):
                     root = event_root(urljoin('https://idolmaster-official.jp/news/' + page + '.html', anchor['href']))
                     if not root:
@@ -244,6 +249,24 @@ class ImasLiveService:
                         row = {'id': article.cms_id, 'official_url': root}
                         existing[key] = row
                     self.db.set_meta('refresh_hint:' + row['id'], stamp)
+                if len(roots) == 1:
+                    root = next(iter(roots))
+                    event = existing[_canonical_event_url(root)]
+                    news_url = 'https://idolmaster-official.jp/news/' + page + '.html'
+                    rounds = parse_ticket_news(html, news_url)
+                    known = {t['id']: t for t in self.db.ticket_query_rows() if t['event_id'] == event['id']}
+                    selected = [t for t in rounds if event['id'] + ':' + t.stable_key not in known or
+                                not self._source_is_fresh(known[event['id'] + ':' + t.stable_key], datetime.now(timezone.utc)) or
+                                known[event['id'] + ':' + t.stable_key].get('verified_source_url') == news_url]
+                    if selected:
+                        digest = hashlib.sha256(json.dumps([t.record() for t in selected], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                        try:
+                            updated = datetime.fromtimestamp(float(item.get('updated')), timezone.utc)
+                        except (ValueError, TypeError, OSError, OverflowError):
+                            updated = None
+                        self.db.save_parsed(event['id'], news_url, digest, 'official-news-v1', selected, [], [], [],
+                                            ticket_only=True, announce_initial=bool(baseline and updated and updated > baseline))
+                self.db.set_meta(ticket_marker, revision)
                 self.db.set_meta(marker, revision)
             self.db.set_meta('last_news_discovery', stamp)
             self.db.set_meta('last_news_error', '; '.join(errors)[:1000])
@@ -270,25 +293,10 @@ class ImasLiveService:
         return changed
 
     async def refresh_open_ticket_sources(self, current: datetime | None = None) -> dict[str, int]:
-        """Bounded on-demand recheck for cached *active* lotteries only.
-
-        This makes a manual ticket query useful when the normal rotating
-        background job has not revisited a currently-open page within the
-        display freshness window.  It does not promote unverified rows.
-        """
+        """Fair bounded recheck, including future LIVE events whose old round ended."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
-        rows = await asyncio.to_thread(self.db.ticket_query_rows)
-        ids: list[str] = []
-        for row in rows:
-            try:
-                start, end = datetime.fromisoformat(row["application_start"]), datetime.fromisoformat(row["application_end"])
-                active = start.tzinfo and end.tzinfo and start <= current.astimezone(end.tzinfo) < end
-            except (TypeError, ValueError):
-                active = False
-            if active and not self._source_is_fresh(row, current):
-                if row["event_id"] not in ids:
-                    ids.append(row["event_id"])
+        ids = await self._ticket_recheck_ids(current, manual=True)
         if not ids or self._sync_lock.locked():
             return {"refreshed": 0, "failed": 0}
         raw = await asyncio.to_thread(self.db.events_by_ids, ids[:max(1, int(self.config.get("ticket_query_refresh_max", 4)))])
@@ -321,41 +329,10 @@ class ImasLiveService:
         """Recheck stale official sources that can affect an upcoming alert."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
-        try:
-            nodes = [max(1, int(value)) for value in self.config.get("ticket_reminder_hours", [24, 1])]
-        except (TypeError, ValueError):
-            nodes = [24, 1]
-        try:
-            recovery_minutes = max(5, int(self.config.get("reminder_recovery_minutes", 20)))
-        except (TypeError, ValueError):
-            recovery_minutes = 20
-        horizon = timedelta(hours=max(nodes), minutes=recovery_minutes)
-        ids: list[str] = []
-        for row in await asyncio.to_thread(self.db.ticket_query_rows):
-            try:
-                start = datetime.fromisoformat(row["application_start"])
-                deadline = datetime.fromisoformat(row["application_end"])
-                now_at_deadline = current.astimezone(deadline.tzinfo)
-            except (TypeError, ValueError):
-                continue
-            if start.tzinfo and deadline.tzinfo and start < deadline and now_at_deadline < deadline and (
-                    start <= now_at_deadline or start - now_at_deadline <= horizon) and not self._source_is_fresh(row, current):
-                ids.append(str(row["event_id"]))
+        ids = await self._ticket_recheck_ids(current, manual=False)
         if not ids or self._sync_lock.locked():
             return {"refreshed": 0, "failed": 0}
-        candidates = await asyncio.to_thread(self.db.source_candidates, current)
-        due_ids = set(ids)
-        selected = []
-        for candidate in candidates:
-            if candidate['id'] not in due_ids:
-                continue
-            attempted = self._ticket_moment(candidate['attempted_at'])
-            if attempted and timedelta(0) <= current - attempted < timedelta(minutes=5):
-                continue
-            selected.append(candidate['id'])
-            if len(selected) >= max(1, int(self.config.get('ticket_query_refresh_max', 4))):
-                break
-        rows = await asyncio.to_thread(self.db.events_by_ids, selected)
+        rows = await asyncio.to_thread(self.db.events_by_ids, ids)
         refreshed = failed = 0
         async with self._sync_lock:
             for row in rows:
@@ -383,6 +360,38 @@ class ImasLiveService:
             logger.info("IM@S due-ticket recheck: refreshed=%s failed=%s", refreshed, failed)
         return {"refreshed": refreshed, "failed": failed}
 
+    async def _ticket_recheck_ids(self, current: datetime, manual: bool) -> list[str]:
+        zone = ZoneInfo(str(self.config.get('display_timezone', 'Asia/Shanghai')))
+        by_event: dict[str, list[dict[str, Any]]] = {}
+        for row in await asyncio.to_thread(self.db.ticket_performances):
+            by_event.setdefault(row['event_id'], []).append(row)
+        open_ids, stale_ids = set(), set()
+        for row in await asyncio.to_thread(self.db.ticket_query_rows):
+            start, end = self._ticket_moment(row['application_start']), self._ticket_moment(row['application_end'])
+            if start and end and start <= current < end:
+                open_ids.add(row['event_id'])
+                if not self._source_is_fresh(row, current):
+                    stale_ids.add(row['event_id'])
+        selected = []
+        candidates = await asyncio.to_thread(self.db.source_candidates, current)
+        for row in sorted(candidates, key=lambda r: (r['attempted_at'] or '', r['id'])):
+            attempted = self._ticket_moment(row['attempted_at'])
+            if attempted and timedelta(0) <= current - attempted < timedelta(minutes=5):
+                continue
+            event_performances = by_event.get(row['id'], [])
+            if not event_performances and row.get('event_display'):
+                event_performances = [vars_for_slots(p) for p in schedule_performances(row['event_display'], row['official_url'])]
+            future_live = bool(event_performances) and self._ticket_event_window(event_performances, current, zone)[0]
+            if not future_live and row['id'] not in open_ids:
+                continue
+            fetched = self._ticket_moment(row['fetched_at'])
+            interval = timedelta(minutes=5 if manual and row['id'] not in open_ids else max(15, int(self.config.get('sync_interval_minutes', 60))))
+            if row['source_quality'] != 'verified' or not fetched or current - fetched >= interval or row['id'] in stale_ids:
+                selected.append(row['id'])
+            if len(selected) >= max(1, int(self.config.get('ticket_query_refresh_max', 4))):
+                break
+        return selected
+
     async def _collect_special(self, article: CmsArticle) -> ParsedPage:
         """Follow actual links under this event only, including HTML meta redirects."""
         root = event_root(article.url)
@@ -393,6 +402,9 @@ class ImasLiveService:
         selected_stop = None
         result = ParsedPage()
         ticket_rows = {}
+        information_seen = False
+        city_performances: dict[str, list[str]] = {}
+        cast_pages: list[ParsedPage] = []
         while queue and len(visited) < 8:
             url = urldefrag(queue.pop(0))[0]
             if url in visited:
@@ -420,20 +432,29 @@ class ImasLiveService:
             result.cast_asset_urls.extend(official_roster_image_urls(html, url))
             performances = parse_information(html, url)
             if performances and (not result.performances or '/information' in url):
-                result.performances = performances
+                if '/information' in url:
+                    if not information_seen:
+                        result.performances = []
+                        information_seen = True
+                    merged = {(p.date, p.session_label, p.venue): p for p in result.performances}
+                    for performance in performances:
+                        merged.setdefault((performance.date, performance.session_label, performance.venue), performance)
+                    result.performances = list(merged.values())
+                    city = urlsplit(url).path.rsplit('/', 1)[-1]
+                    if city.endswith('.php'):
+                        city_performances[city] = [merged[(p.date, p.session_label, p.venue)].stable_key for p in performances]
+                else:
+                    result.performances = performances
             if '283production_msp' in root:
                 cast_data = parse_shiny_information(html, url)
                 if cast_data.cast:
-                    result.cast, result.performances = cast_data.cast, cast_data.performances
-                    for row in result.performances:
+                    for row in cast_data.performances:
                         row.venue = parse_venue(html) or article.venue
+                    cast_pages.append(cast_data)
             elif 'cast' in url.lower() or '出演者' in clean(soup.get_text(' ')):
                 cast_data = parse_day_cast(html, url)
                 if cast_data.cast:
-                    result.cast = cast_data.cast
-                    # A dedicated CAST page gives more reliable day bindings
-                    # than the overview page, so retain its paired sessions.
-                    result.performances = cast_data.performances
+                    cast_pages.append(cast_data)
             destinations = []
             for meta in soup.select('meta[http-equiv]'):
                 if meta.get('http-equiv', '').lower() == 'refresh':
@@ -459,7 +480,25 @@ class ImasLiveService:
                 queue.append(destination)
         if queue:
             raise SourceUnavailable('专题链接超过单轮8页上限，未完成核验，保留旧记录')
+        for cast_data in cast_pages:
+            # A day-level CAST heading cannot replace precise information-page
+            # clocks or discard other cities. Bind its roster to known sessions.
+            if not result.performances:
+                result.performances = cast_data.performances
+            cast_days = {p.stable_key: p.date for p in cast_data.performances}
+            for appearance in cast_data.cast:
+                day = cast_days.get(appearance.performance_key)
+                sessions = [p for p in result.performances if p.date == day] if day else []
+                if not sessions:
+                    sessions = [p for p in cast_data.performances if p.stable_key == appearance.performance_key]
+                    result.performances.extend(sessions)
+                result.cast.extend(replace(appearance, performance_key=p.stable_key) for p in sessions)
         result.ticket_rounds = list(ticket_rows.values())
+        for ticket in result.ticket_rounds:
+            if ticket.evidence:
+                city = urlsplit(ticket.evidence.url).path.rsplit('/', 1)[-1]
+                if city in city_performances:
+                    ticket.performance_keys = city_performances[city]
         result.cast_asset_urls = list(dict.fromkeys(result.cast_asset_urls))
         return result
 
@@ -619,14 +658,30 @@ class ImasLiveService:
             return False
 
     async def ticket_entries(self, current: datetime | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str]:
-        """Show all collected onsite lotteries; freshness affects status, not visibility."""
+        """Keep onsite lottery/resale rounds until the final LIVE session starts."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
         start, end, _ = self._month_window(current, None)
         rows = await asyncio.to_thread(self.db.ticket_query_rows)
+        performances = await asyncio.to_thread(self.db.ticket_performances)
+        by_event: dict[str, list[dict[str, Any]]] = {}
+        for performance in performances:
+            by_event.setdefault(performance['event_id'], []).append(performance)
         entries: list[dict[str, Any]] = []
         for row in rows:
             if not self._brand_allowed(row["brands_json"]):
+                continue
+            event_performances = by_event.get(row['event_id'], [])
+            if not event_performances and row.get('event_display'):
+                event_performances = [vars_for_slots(p) for p in schedule_performances(
+                    row['event_display'], row['source_url'], row.get('event_venue'))]
+            retained, live_start = self._ticket_event_window(event_performances, current, zone)
+            if not retained:
+                continue
+            bound_keys = json.loads(row.get('performance_keys_json') or '[]')
+            bound_ids = set(bound_keys) | {row['event_id'] + ':' + key for key in bound_keys}
+            bound = [p for p in event_performances if p.get('id') in bound_ids]
+            if bound_keys and bound and not self._ticket_event_window(bound, current, zone)[0]:
                 continue
             application_start = self._ticket_moment(row.get("application_start"))
             deadline = self._ticket_moment(row.get("application_end"))
@@ -640,15 +695,19 @@ class ImasLiveService:
                 details.append(self._ticket_time(row["application_end"], "截止", zone))
             else:
                 details.append("截止：待核验")
-            if row.get("performance_date") or row.get("performance_venue"):
+            shown_performances = bound or event_performances
+            dates = sorted({p['date'] for p in shown_performances if p.get('date')})
+            date_text = '～'.join(dict.fromkeys([dates[0], dates[-1]])).replace('-', '/') if dates else ''
+            venues = list(dict.fromkeys(clean(p['venue']) for p in shown_performances if p.get('venue')))
+            if date_text or venues:
                 details.append("演出：" + "｜".join(part for part in (
-                    str(row["performance_date"]).replace("-", "/") if row.get("performance_date") else "",
-                    clean(row["performance_venue"] or "") if row.get("performance_venue") else "",
+                    date_text, '／'.join(venues),
                 ) if part))
             entries.append({"kind": "ticket", "title": row["title"], "subtitle": "\n".join(details),
                             "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"],
                             "ticket_status": ticket_status, "status_label": status_label,
                             "event_id": row["event_id"], "public_number": row.get("public_number"),
+                            "live_start": live_start,
                             "sort_time": deadline or datetime.max.replace(tzinfo=timezone.utc),
                             "source_fetched_at": row.get("source_fetched_at")})
         priority = {"urgent": 0, "open": 1, "upcoming": 2, "stale": 3, "unknown": 3, "ended": 4}
@@ -658,8 +717,27 @@ class ImasLiveService:
         for group in groups.values():
             group.sort(key=lambda item: (priority[item["ticket_status"]], item["sort_time"], item["subtitle"]))
         ordered = sorted(groups.values(), key=lambda group: (
-            priority[group[0]["ticket_status"]], group[0]["sort_time"], group[0]["title"], group[0]["event_id"]))
+            group[0]['live_start'], group[0]["title"], group[0]["event_id"]))
         return [item for group in ordered for item in group], start, end, self._status(current, zone)
+
+    def _ticket_event_window(self, performances: list[dict[str, Any]], current: datetime,
+                             zone: ZoneInfo) -> tuple[bool, datetime]:
+        """Keep a tour until every known session has started; unknown dates stay visible."""
+        moments = []
+        retained = not performances
+        for performance in performances:
+            moment, precise = self._performance_moment(performance, zone)
+            if moment is None:
+                retained = True
+                continue
+            moments.append(moment)
+            if precise:
+                retained |= current < moment
+            else:
+                # Date-only schedules are official Japanese dates. Midnight is
+                # used for ordering only, never as a claimed start time.
+                retained |= current.astimezone(ZoneInfo('Asia/Tokyo')).date() <= moment.astimezone(ZoneInfo('Asia/Tokyo')).date()
+        return bool(retained), min(moments, default=datetime.max.replace(tzinfo=timezone.utc))
 
     @staticmethod
     def _ticket_moment(value: str | None) -> datetime | None:
@@ -682,6 +760,8 @@ class ImasLiveService:
             status, label = "urgent", "24小时内截止"
         else:
             status, label = "open", "抽选中"
+        if row.get('sale_method') == 'resale':
+            label = '转售 · ' + ('受理中' if status == 'open' else label)
         if not self._source_is_fresh(row, current):
             return ("ended" if status == "ended" else "stale"), label + " · 待核验"
         return status, label
@@ -772,14 +852,14 @@ class ImasLiveService:
             return None
         event = detail["event"]
         tickets = [row for row in detail["tickets"] if row.get("ticket_scope") == "onsite"]
+        evidence_rows = {row['id']: row for row in await asyncio.to_thread(self.db.ticket_query_rows)}
         result: list[dict[str, Any]] = []
         for row in tickets:
-            ticket_status, status = self._ticket_display_status({**row,
-                'source_fetched_at': event.get('source_fetched_at'), 'source_quality': event.get('source_quality')}, current)
+            evidence_row = evidence_rows.get(row['id'], {**row,
+                'source_fetched_at': event.get('source_fetched_at'), 'source_quality': event.get('source_quality')})
+            ticket_status, status = self._ticket_display_status(evidence_row, current)
             if row["sale_method"] == "first_come":
                 status, ticket_status = "一般销售/先到先得", "unknown"
-            elif row["sale_method"] == "resale":
-                status, ticket_status = "官方转售", "unknown"
             details = [f"{status}｜{row['name']}"]
             if row.get("application_end"):
                 try: details.append(self._ticket_time(row["application_end"], "截止", zone))
@@ -787,7 +867,7 @@ class ImasLiveService:
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "\n".join(details),
                            "brands": json.loads(event["brands_json"]), "url": row.get("url") or row.get("source_url"),
                            "ticket_status": ticket_status, "status_label": status,
-                           "public_number": event["public_number"], "sort_time": row.get("application_end") or "", "source_fetched_at": event.get("source_fetched_at")})
+                           "public_number": event["public_number"], "sort_time": row.get("application_end") or "", "source_fetched_at": evidence_row.get("source_fetched_at")})
         if not result:
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "尚未公布可核验的现场票务轮次。",
                            "brands": json.loads(event["brands_json"]), "url": event.get("official_url") or "",

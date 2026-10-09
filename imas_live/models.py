@@ -29,6 +29,7 @@ class TicketRound:
     seats: str | None = None
     eligibility: str | None = None
     evidence: Evidence | None = None
+    performance_keys: list[str] = field(default_factory=list)
 
     def record(self) -> dict[str, Any]:
         value = asdict(self)

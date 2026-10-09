@@ -141,6 +141,18 @@ class Database:
             if not any(row['name'] == 'attempted_at' for row in db.execute('PRAGMA table_info(sources)')):
                 db.execute("ALTER TABLE sources ADD COLUMN attempted_at TEXT")
                 db.execute("UPDATE sources SET attempted_at=fetched_at")
+            ticket_columns = {row['name'] for row in db.execute('PRAGMA table_info(ticket_rounds)')}
+            for name, definition in (
+                ('verified_source_url', 'TEXT'), ('verified_at', 'TEXT'),
+                ('verification_quality', "TEXT NOT NULL DEFAULT 'verified'"),
+                ('performance_keys_json', "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if name not in ticket_columns:
+                    db.execute(f'ALTER TABLE ticket_rounds ADD COLUMN {name} {definition}')
+            if 'verified_source_url' not in ticket_columns:
+                db.execute("""UPDATE ticket_rounds SET verified_source_url=COALESCE(
+                    (SELECT e.official_url FROM events e JOIN sources s ON s.event_id=e.id AND s.url=e.official_url
+                     WHERE e.id=ticket_rounds.event_id),source_url)""")
             # Upgrade existing installations before their next directory sync.
             # First assignment prefers the nearest dated performance, then
             # stable creation/ID ordering; it is never used as a live ranking.
@@ -175,7 +187,8 @@ class Database:
 
     def save_parsed(self, event_id: str, source_url: str, content_hash: str, parser: str,
                     tickets: Iterable[TicketRound], performances: Iterable[Performance],
-                    cast: Iterable[CastAppearance], review_notes: Iterable[str]) -> bool:
+                    cast: Iterable[CastAppearance], review_notes: Iterable[str], ticket_only: bool = False,
+                    announce_initial: bool = False) -> bool:
         """Store one page atomically. Return true only for a meaningful page change."""
         stamp = now()
         # Do this before opening the write transaction.  Exact duplicate PC/SP
@@ -194,23 +207,44 @@ class Database:
                 fetched_at=excluded.fetched_at,parser=excluded.parser,quality='verified',error=NULL""",
                 (source_url, event_id, content_hash, stamp, parser))
             db.execute('UPDATE sources SET attempted_at=? WHERE event_id=? AND url=?', (stamp, event_id, source_url))
+            current_ids = [f'{event_id}:{row.stable_key}' for row in tickets]
+            # Preserve historical rounds, but a disappeared round is no longer
+            # reverified by a successful fetch of the newer page.
+            placeholders = ','.join('?' for _ in current_ids) or "''"
+            db.execute(f"""UPDATE ticket_rounds SET verification_quality='stale'
+                WHERE event_id=? AND (verified_source_url=? OR (verified_source_url IS NULL AND source_url=?))
+                AND id NOT IN ({placeholders})""", (event_id, source_url, source_url, *current_ids))
+            for round_id in current_ids:
+                db.execute("""UPDATE ticket_rounds SET verified_source_url=?,verified_at=?,verification_quality='verified'
+                    WHERE id=?""", (source_url, stamp, round_id))
             if not changed:
                 if not source_baselined:
                     db.execute("INSERT OR IGNORE INTO ticket_source_baselines VALUES(?,?,?)", (event_id, source_url, stamp))
                 return False
             db.execute("INSERT OR IGNORE INTO revisions(source_url,content_hash,observed_at,summary) VALUES(?,?,?,?)",
                        (source_url, content_hash, stamp, f"{parser} changed"))
-            # Replacing records from this exact source keeps IDs stable across deadline changes.
-            db.execute("DELETE FROM ticket_rounds WHERE event_id=?", (event_id,))
+            # Upsert current rounds without removing history; stable IDs survive deadline edits.
             if performances:
                 db.execute("DELETE FROM performances WHERE event_id=?", (event_id,))
-            db.execute("DELETE FROM cast_appearances WHERE event_id=?", (event_id,))
+            if not ticket_only:
+                db.execute("DELETE FROM cast_appearances WHERE event_id=?", (event_id,))
             for row in tickets:
                 evidence = row.evidence
-                db.execute("""INSERT INTO ticket_rounds VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                db.execute("""INSERT INTO ticket_rounds
+                    (id,event_id,name,ticket_scope,sale_method,application_start,application_end,result_at,
+                     payment_start,payment_end,url,seats,eligibility,source_url,excerpt,quality,
+                     verified_source_url,verified_at,verification_quality,performance_keys_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,ticket_scope=excluded.ticket_scope,sale_method=excluded.sale_method,
+                    application_start=excluded.application_start,application_end=excluded.application_end,
+                    result_at=excluded.result_at,payment_start=excluded.payment_start,payment_end=excluded.payment_end,
+                    url=excluded.url,seats=excluded.seats,eligibility=excluded.eligibility,source_url=excluded.source_url,
+                    excerpt=excluded.excerpt,quality=excluded.quality,verified_source_url=excluded.verified_source_url,
+                    verified_at=excluded.verified_at,verification_quality='verified',performance_keys_json=excluded.performance_keys_json""", (
                     f'{event_id}:{row.stable_key}',event_id,row.name,row.ticket_scope,row.sale_method,row.application_start,row.application_end,
                     row.result_at,row.payment_start,row.payment_end,row.url,row.seats,row.eligibility,
-                    evidence.url if evidence else source_url,evidence.excerpt if evidence else "",evidence.quality if evidence else "verified"))
+                    evidence.url if evidence else source_url,evidence.excerpt if evidence else "",evidence.quality if evidence else "verified",
+                    source_url,stamp,'verified',json.dumps(row.performance_keys)))
             for row in performances:
                 evidence = row.evidence
                 db.execute("INSERT INTO performances VALUES(?,?,?,?,?,?,?,?,?)", (
@@ -229,7 +263,8 @@ class Database:
                 WHERE event_id=?""", (event_id,)).fetchone()
             if not source_baselined:
                 db.execute("INSERT OR IGNORE INTO ticket_source_baselines VALUES(?,?,?)", (event_id, source_url, stamp))
-                candidate_ids = set(current_tickets) if initial and not initial["initial_ticket_notice_recorded"] else set()
+                candidate_ids = (set(current_tickets) - prior_ticket_ids) if announce_initial else (
+                    set(current_tickets) if initial and not initial["initial_ticket_notice_recorded"] else set())
                 if initial and not initial["initial_ticket_notice_recorded"]:
                     db.execute("""UPDATE ticket_new_event_discoveries SET initial_ticket_notice_recorded=1
                         WHERE event_id=?""", (event_id,))
@@ -532,32 +567,29 @@ class Database:
                     SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
                     THEN e.official_url ELSE p.source_url END
                 WHERE p.date IS NOT NULL AND p.status!='cancelled'""")]
-            deadlines = [dict(row) for row in db.execute("""SELECT t.*,e.title,e.brands_json,e.event_display,e.venue,n.public_number,
-                    s.fetched_at AS source_fetched_at,s.quality AS source_quality
-                FROM ticket_rounds t JOIN events e ON e.id=t.event_id
-                LEFT JOIN event_numbers n ON n.event_id=e.id
-                LEFT JOIN sources s ON s.event_id=e.id AND s.url=CASE WHEN EXISTS(
-                    SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
-                    THEN e.official_url ELSE t.source_url END
-                WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.application_end IS NOT NULL
-                  AND t.quality='verified'""")]
+        deadlines = [row for row in self.ticket_query_rows() if row['sale_method'] == 'lottery' and row['application_end']]
         return performances, deadlines
 
-    def ticket_query_rows(self) -> list[dict[str, Any]]:
-        """Return every verified onsite lottery round with source freshness evidence."""
+    def ticket_performances(self) -> list[dict[str, Any]]:
         with self._connect() as db:
-            rows = db.execute("""SELECT t.*,e.title,e.brands_json,e.venue AS event_venue,n.public_number,
-                    s.fetched_at AS source_fetched_at,s.quality AS source_quality,
+            return [dict(row) for row in db.execute("SELECT * FROM performances WHERE status!='cancelled'")]
+
+    def ticket_query_rows(self) -> list[dict[str, Any]]:
+        """All onsite lottery/resale rounds, with independently verified evidence."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT t.*,e.title,e.brands_json,e.event_display,e.venue AS event_venue,n.public_number,
+                    CASE WHEN t.verified_at IS NULL THEN s.fetched_at ELSE MIN(t.verified_at,s.fetched_at) END AS source_fetched_at,
+                    CASE WHEN t.verification_quality!='verified' THEN 'stale' ELSE s.quality END AS source_quality,
                     MIN(p.date) AS performance_date,
                     COALESCE(MIN(NULLIF(p.venue,'')), e.venue) AS performance_venue
                 FROM ticket_rounds t
                 JOIN events e ON e.id=t.event_id
                 LEFT JOIN event_numbers n ON n.event_id=e.id
                 LEFT JOIN performances p ON p.event_id=e.id AND p.date IS NOT NULL AND p.status!='cancelled'
-                LEFT JOIN sources s ON s.event_id=e.id AND s.url=CASE WHEN EXISTS(
+                LEFT JOIN sources s ON s.event_id=e.id AND s.url=COALESCE(t.verified_source_url,CASE WHEN EXISTS(
                     SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
-                    THEN e.official_url ELSE t.source_url END
-                WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.quality='verified'
+                    THEN e.official_url ELSE t.source_url END)
+                WHERE t.ticket_scope='onsite' AND t.sale_method IN ('lottery','resale') AND t.quality='verified'
                 GROUP BY t.id
                 ORDER BY t.application_end IS NULL,t.application_end,t.application_start,t.id""").fetchall()
         return [dict(row) for row in rows]
@@ -566,12 +598,14 @@ class Database:
         """Return queued verified additions that still exist in the latest page."""
         with self._connect() as db:
             rows = db.execute("""SELECT q.round_id,q.observed_at,q.source_url AS announced_source_url,
-                    t.*,e.title,e.brands_json,n.public_number,s.fetched_at AS source_fetched_at,s.quality AS source_quality
+                    t.*,e.title,e.brands_json,n.public_number,
+                    CASE WHEN t.verified_at IS NULL THEN s.fetched_at ELSE MIN(t.verified_at,s.fetched_at) END AS source_fetched_at,
+                    CASE WHEN t.verification_quality!='verified' THEN 'stale' ELSE s.quality END AS source_quality
                 FROM ticket_new_rounds q
                 JOIN ticket_rounds t ON t.id=q.round_id
                 JOIN events e ON e.id=t.event_id
                 LEFT JOIN event_numbers n ON n.event_id=e.id
-                LEFT JOIN sources s ON s.event_id=q.event_id AND s.url=q.source_url
+                LEFT JOIN sources s ON s.event_id=q.event_id AND s.url=COALESCE(t.verified_source_url,q.source_url)
                 WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.quality='verified'
                 ORDER BY q.observed_at,q.round_id""").fetchall()
         return [dict(row) for row in rows]

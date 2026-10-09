@@ -326,6 +326,42 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
     return parsed
 
 
+def parse_ticket_news(html: str, source_url: str) -> list[TicketRound]:
+    """Only explicit onsite news fields, bounded to one labelled reception block."""
+    soup = BeautifulSoup(html, 'html.parser')
+    rows = {}
+    for block in soup.select('.c-txt'):
+        links = list(dict.fromkeys(a['href'] for a in block.select('a[href]')
+                                  if a['href'].startswith('https://asobiticket2.asobistore.jp/receptions/')))
+        if not links:
+            continue
+        heading = block.find_previous(['h2', 'h3', 'h4', 'h5', 'h6'])
+        title = clean(heading.get_text(' ')) if heading else ''
+        scope_heading = heading.find_previous(['h2', 'h3', 'h4']) if heading else None
+        if not scope_heading or '現地チケット' not in clean(scope_heading.get_text(' ')) or _method(title) not in {'lottery', 'resale'}:
+            continue
+        lines = [clean(line).strip('✦★●・ ') for line in block.get_text('\n', strip=True).splitlines()]
+        fields = {}
+        for i, line in enumerate(lines[:-1]):
+            if line in {'受付期間', '当落発表', '入金期間', '受付対象席種'}:
+                if line in fields:
+                    fields = {}  # Several periods in one block are ambiguous.
+                    break
+                fields[line] = lines[i+1]
+        start, end = _range(fields.get('受付期間'))
+        if not start or not end or end <= start:
+            continue
+        pay_start, pay_end = _range(fields.get('入金期間'))
+        for link in links:
+            row = TicketRound(stable(link), title, 'onsite', _method(title), start, end,
+                              result_at=japan_datetime(fields.get('当落発表', '')),
+                              payment_start=pay_start, payment_end=pay_end, url=link,
+                              seats=fields.get('受付対象席種'),
+                              evidence=Evidence(source_url, clean(block.get_text(' '))[:400], 'official-news-v1'))
+            rows[row.stable_key] = row
+    return list(rows.values())
+
+
 def schedule_performances(text: str, source_url: str, venue: str | None = None,
                           directory: bool = False) -> list[Performance]:
     """Read explicit dates only; continuous ranges are never expanded into sessions."""

@@ -17,5 +17,5 @@
   "font_path": {"description": "图片字体文件路径（可选）", "type": "string", "default": "", "hint": "自动寻找 Windows 中文字体或 Linux Noto CJK；容器需安装字体或配置容器内字体路径。"},
   "max_pages": {"description": "单次活动目录最大页数", "type": "int", "default": 30, "hint": "防止上游分页异常；2026年10月官网样本约20页。"}
   ,"max_special_pages": {"description": "一次同步最多抓取的官方专题页数", "type": "int", "default": 12, "hint": "单域名串行限速；目录仍会完整保存为候选，后续轮换核验。"}
-  ,"ticket_query_refresh_max": {"description": "单次查询或五分钟检查最多复核的专题数", "type": "int", "default": 4, "hint": "查询复核已知开放抽选；后台同时覆盖临近开始、超过新鲜度的轮次。每个活动只占一个名额，失败会轮换重试。"}
+  ,"ticket_query_refresh_max": {"description": "单次查询或五分钟检查最多复核的专题数", "type": "int", "default": 4, "hint": "复核开放轮次及仍未演出但旧轮已结束的 LIVE，避免漏掉后续先行。按最后尝试时间轮换，每个活动只占一个名额，失败至少退避五分钟。"}
 }
