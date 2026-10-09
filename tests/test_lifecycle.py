@@ -158,7 +158,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             plugin._sync_loop, plugin._reminder_loop = idle, idle
             responses = await asyncio.wait_for(module._test_filter.dispatch(plugin, 'imaslive 10', event), timeout=3)
-            self.assertEqual([item[0] for item in responses], ['text', 'chain'])
+            self.assertEqual([item[0] for item in responses], ['text', 'chain', 'text'])
+            self.assertIn('/imasticket get <编号>', responses[-1][1])
             await plugin.terminate()
 
     async def test_first_directory_failure_returns_status_without_long_wait(self):

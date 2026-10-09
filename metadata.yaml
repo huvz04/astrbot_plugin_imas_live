@@ -1,11 +1,12 @@
 name: astrbot_plugin_imas_live
 display_name: 偶像大师 LIVE 与抽票
-short_desc: 月份 LIVE 图片日历、现场抽选公告与截止提醒
+short_desc: LIVE 与票务图片总览、活动合并详情及抽选提醒
 desc: |
   从偶像大师官网公开目录、新闻和专题页同步活动、场次与票务轮次，提供月份 LIVE 与演出前全部已收录抽选、转售 PNG 图片。
+  查询先显示总览图，再以原生合并转发按活动展示缓存详情；不支持的平台回退简短编号索引。
   群内可订阅 LIVE 开演提醒与官网新增现场抽选公告；抽票截止提醒独立设置。不登录票务站、不查询个人中签或库存。
   机票监测由独立插件承接；本插件只负责 LIVE 日历、票务与提醒。
-version: 0.4.12
+version: 0.4.13
 author: huvz04
 repo: "https://github.com/huvz04/astrbot_plugin_imas_live"
 astrbot_version: ">=4.18.0"

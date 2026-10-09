@@ -634,8 +634,12 @@ class ImasLiveService:
             if start.date() <= display_day < end.date():
                 venue = clean(row["venue"] or row["event_venue"] or "场馆待核验")
                 session = row["session_label"] or "场次待核验"
+                moment, precise = self._performance_moment(row, zone)
                 entries.append({"kind": "performance", "display_date": row["date"], "title": row["title"],
                                 "subtitle": f"{session}｜{venue}", "brands": json.loads(row["brands_json"]), "url": row["source_url"],
+                                "event_id": row['event_id'], "performance_id": row['id'],
+                                "session_label": session, "venue": venue,
+                                "start_at": moment.isoformat() if precise else None,
                                 "public_number": row.get("public_number"), "source_fetched_at": row.get("source_fetched_at")})
         entries.sort(key=lambda item: (item["display_date"], item["title"], item["subtitle"]))
         return entries, start, end, self._status(current, zone), title
@@ -707,6 +711,9 @@ class ImasLiveService:
                             "brands": json.loads(row["brands_json"]), "url": row["url"] or row["source_url"],
                             "ticket_status": ticket_status, "status_label": status_label,
                             "event_id": row["event_id"], "public_number": row.get("public_number"),
+                            "ticket_id": row['id'], "round_name": row['name'], "seats": row.get('seats'),
+                            "application_start": row.get('application_start'), "application_end": row.get('application_end'),
+                            "application_url": row.get('url'),
                             "live_start": live_start,
                             "sort_time": deadline or datetime.max.replace(tzinfo=timezone.utc),
                             "source_fetched_at": row.get("source_fetched_at")})
@@ -719,6 +726,67 @@ class ImasLiveService:
         ordered = sorted(groups.values(), key=lambda group: (
             group[0]['live_start'], group[0]["title"], group[0]["event_id"]))
         return [item for group in ordered for item in group], start, end, self._status(current, zone)
+
+    async def query_detail_texts(self, entries: list[dict[str, Any]], kind: str) -> list[str]:
+        """One cached detail per displayed event; never fetch or expand a LIVE window."""
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for entry in entries:
+            groups.setdefault(entry['event_id'], []).append(entry)
+        zone = ZoneInfo('Asia/Shanghai')
+        texts = []
+        for event_id, group in groups.items():
+            detail = await asyncio.to_thread(self.db.detail, event_id)
+            event = detail['event'] if detail else {}
+            first = group[0]
+            lines = [f"#{first.get('public_number') or '?'} · {first['title']}"]
+            if kind == 'ticket':
+                performances = [p for p in (detail or {}).get('performances', []) if p['status'] != 'cancelled']
+                for p in sorted(performances, key=lambda p: (p.get('date') or '9999', p.get('session_label') or '')):
+                    moment, precise = self._performance_moment(p, zone)
+                    time_text = self._ticket_time(moment.isoformat(), '开演', zone) if precise else '开演时间待核验'
+                    lines.append(f"演出：{p.get('date') or '日期待核验'}｜{p.get('session_label') or '场次待核验'}｜{p.get('venue') or '场馆待核验'}\n{time_text}")
+                if not performances:
+                    lines.append('演出日期／场次／场地：待核验。')
+                for row in group:
+                    lines.append(f"\n轮次：{row['round_name']}\n状态：{row['status_label']}")
+                    if row.get('seats') and row['seats'] not in row['round_name']:
+                        lines.append('席种：' + row['seats'])
+                    for key, label in [('application_start', '开始'), ('application_end', '截止')]:
+                        value = self._ticket_moment(row.get(key))
+                        lines.append(self._ticket_time(value.isoformat(), label, zone) if value else label+'：待核验')
+                    if row.get('application_url'):
+                        cached = '（缓存，待核验）' if '待核验' in row['status_label'] else ''
+                        lines.append(f"申请链接{cached}：{row['application_url']}")
+                    else:
+                        lines.append('独立申请链接：未收录，请查看官方页或游戏内公告。')
+            else:
+                cast = (detail or {}).get('cast', [])
+                assets = await asyncio.to_thread(self.db.cast_asset_rows, event_id)
+                asset_urls = set()
+                for row in group:  # Only the exact displayed sessions, not detail['performances'].
+                    moment = self._ticket_moment(row.get('start_at'))
+                    lines.append(f"\n演出：{row['display_date']}｜{row['session_label']}｜{row['venue']}")
+                    lines.append(self._ticket_time(moment.isoformat(), '开演', zone) if moment else '开演时间待公布／待核验')
+                    performance_id = row['performance_id']
+                    keys = {performance_id, performance_id.removeprefix(event_id+':')}
+                    relevant = [p for p in cast if p.get('performance_id') in keys]
+                    cast_label = '官方出演资料：'
+                    if not relevant:
+                        relevant = [p for p in cast if not p.get('performance_id')]
+                        cast_label = '官方出演资料（活动级，未细分本场）：'
+                    names = list(dict.fromkeys(p['person_name'] + (f"（{p['role_name']}）" if p.get('role_name') else '') for p in relevant))
+                    lines.append(cast_label+'、'.join(names) if names else '官方出演资料：未收录可核验的本场文字名单。')
+                    day = re.search(r'DAY\s*(\d+)', row['session_label'], re.I)
+                    for asset in assets:
+                        image_day = re.search(r'bnr_day(\d+)\.webp', asset['image_url'], re.I)
+                        if image_day and (not day or image_day.group(1) != day.group(1)):
+                            continue
+                        if asset['image_url'] not in asset_urls:
+                            lines.append('官方出演图：'+asset['image_url'])
+                            asset_urls.add(asset['image_url'])
+            lines.append('\n官方活动页：'+str(event.get('official_url') or first.get('url') or '未收录'))
+            texts.append('\n'.join(lines))
+        return texts
 
     def _ticket_event_window(self, performances: list[dict[str, Any]], current: datetime,
                              zone: ZoneInfo) -> tuple[bool, datetime]:

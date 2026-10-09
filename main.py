@@ -22,6 +22,10 @@ except ModuleNotFoundError:  # lightweight import fallback for offline unit test
     class Plain:
         def __init__(self, text: str): self.text = text
 from astrbot.api.star import Context, Star
+try:
+    from astrbot.api.message_components import Node, Nodes
+except ImportError:  # Old/unsupported adapters still receive the overview and a short index.
+    Node = Nodes = None
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .imas_live.render import CalendarRenderer
@@ -45,7 +49,7 @@ def parse_live_month(argument: str) -> int | None:
 
 
 class ImasLivePlugin(Star):
-    """Keep group interaction deliberately small: only /imaslive returns PNG pages."""
+    """Calendar/ticket overviews with cached native detail forwards."""
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context, config)
@@ -190,6 +194,40 @@ class ImasLivePlugin(Star):
             chain.append(Plain("\n" + "\n".join(links)))
         return event.chain_result(chain)
 
+    @staticmethod
+    def _query_index(entries: list[dict]) -> str:
+        groups = {}
+        for row in entries:
+            groups.setdefault(row['event_id'], row)
+        rows = list(groups.values())
+        lines = ['当前平台不支持合并转发或发送失败；总览图已保留。', '活动索引：']
+        lines.extend(f"#{row.get('public_number') or '?'} · {row['title'][:36]}" for row in rows[:12])
+        if len(rows) > 12:
+            lines.append(f'另有 {len(rows)-12} 个活动，编号见总览图。')
+        lines.append('可用 /imasticket get <编号> 查看该活动的已缓存详情。')
+        return '\n'.join(lines)
+
+    async def _send_query_details(self, event: AstrMessageEvent, entries: list[dict], kind: str) -> str | None:
+        """Send one native forward after the overview; failure cannot undo the image."""
+        if not entries:
+            return None
+        try:
+            if event.get_platform_name() != 'aiocqhttp' or Node is None or Nodes is None:
+                return self._query_index(entries)
+            self_id = str(event.get_self_id() or '')
+            if not self_id.isdigit() or int(self_id) == 0:
+                return self._query_index(entries)
+            texts = await self.service.query_detail_texts(entries, kind)
+            nodes = [Node(uin=self_id, name='IM@S LIVE', content=[Plain(text)]) for text in texts]
+            if nodes:
+                sent = await event.send(MessageChain([Nodes(nodes=nodes)]))
+                if sent is False:
+                    raise RuntimeError('adapter reported a failed forward send')
+            return None
+        except Exception:
+            logger.exception('IM@S query detail forward failed: kind=%s', kind)
+            return self._query_index(entries)
+
     async def _wait_for_first_directory(self, event: AstrMessageEvent) -> None:
         await self.initialize()
         if not self.service.db.meta('last_directory_sync') and self.config.get('enabled', True):
@@ -227,6 +265,10 @@ class ImasLivePlugin(Star):
         except Exception:
             logger.exception("IM@S calendar image rendering failed")
             yield event.plain_result("日历图片生成失败；请检查插件字体配置和日志。")
+            return
+        fallback = await self._send_query_details(event, entries, 'live')
+        if fallback:
+            yield event.plain_result(fallback)
 
     @filter.command("imaslive next")
     async def imaslive_next(self, event: AstrMessageEvent, brand: str = "", extra_argument: str = ""):
@@ -302,17 +344,14 @@ class ImasLivePlugin(Star):
                 status += f"｜{refresh['failed']} 个专题复核失败，保留上次记录并标记待核验"
             now = datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai"))))
             image = await asyncio.to_thread(self.renderer.render_ticket, entries, start.date(), end.date(), now, status, self._data_updated_at(entries))
-            links: list[str] = []
-            seen: set[str] = set()
-            for entry in entries:
-                url = str(entry.get('url') or '')
-                if url and url not in seen:
-                    seen.add(url)
-                    links.append(f"{entry['title']}｜{entry['subtitle'].splitlines()[0].removeprefix('轮次：')}：{url}")
-            yield self._image_and_links(event, image, links)
+            yield self._image_and_links(event, image, [])
         except Exception:
             logger.exception("IM@S ticket image rendering failed")
             yield event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。")
+            return
+        fallback = await self._send_query_details(event, entries, 'ticket')
+        if fallback:
+            yield event.plain_result(fallback)
 
     @filter.command("imasticket get")
     async def imasticket_get(self, event: AstrMessageEvent, ticket_number: int, extra_argument: str = ""):
