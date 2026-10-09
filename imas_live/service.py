@@ -402,6 +402,7 @@ class ImasLiveService:
         selected_stop = None
         result = ParsedPage()
         ticket_rows = {}
+        ticket_cities: dict[str, set[str]] = {}
         information_seen = False
         city_performances: dict[str, list[str]] = {}
         cast_pages: list[ParsedPage] = []
@@ -429,6 +430,7 @@ class ImasLiveService:
             result.review_notes.extend(parsed.review_notes)
             for row in parsed.ticket_rounds:
                 ticket_rows[row.stable_key] = row
+                ticket_cities.setdefault(row.stable_key, set()).add(urlsplit(url).path.rsplit('/', 1)[-1])
             result.cast_asset_urls.extend(official_roster_image_urls(html, url))
             performances = parse_information(html, url)
             if performances and (not result.performances or '/information' in url):
@@ -495,10 +497,8 @@ class ImasLiveService:
                 result.cast.extend(replace(appearance, performance_key=p.stable_key) for p in sessions)
         result.ticket_rounds = list(ticket_rows.values())
         for ticket in result.ticket_rounds:
-            if ticket.evidence:
-                city = urlsplit(ticket.evidence.url).path.rsplit('/', 1)[-1]
-                if city in city_performances:
-                    ticket.performance_keys = city_performances[city]
+            ticket.performance_keys = list(dict.fromkeys(key for city in sorted(ticket_cities[ticket.stable_key])
+                                                        for key in city_performances.get(city, [])))
         result.cast_asset_urls = list(dict.fromkeys(result.cast_asset_urls))
         return result
 
@@ -922,9 +922,12 @@ class ImasLiveService:
                     created = self.db.subscription_created_at("ticket", umo)
                     if created and created.astimezone(deadline.tzinfo) > due:
                         continue
-                    key = hashlib.sha256(f"ticket|{umo}|{row['id']}|{row['application_end']}|{node}h".encode()).hexdigest()
+                    identity_ids = await asyncio.to_thread(self.db.ticket_identity_ids, row['id'])
+                    keys = [hashlib.sha256(f"ticket|{umo}|{identity}|{row['application_end']}|{node}h".encode()).hexdigest()
+                            for identity in identity_ids]
+                    key = keys[0]
                     payload = f"{row['title']}｜{row['name']}｜{deadline_text}｜提前{node}小时"
-                    claimed = await asyncio.to_thread(self.db.claim_delivery, key, umo, payload)
+                    claimed = await asyncio.to_thread(self.db.claim_delivery, key, umo, payload, 'legacy', keys[1:])
                     if claimed:
                         selected.append({"delivery_key": key, "umo": umo, "title": row["title"], "brands": json.loads(row["brands_json"]),
                                          "subtitle": f"{row['name']}｜{deadline_text}｜提前{node}小时", "url": row["url"] or row["source_url"],
@@ -994,9 +997,11 @@ class ImasLiveService:
                 # accumulated announcements, including after disable/re-enable.
                 if enabled_since and observed < enabled_since:
                     continue
-                key = f"ticket_new|{umo}|{row['round_id']}"
+                identity_ids = await asyncio.to_thread(self.db.ticket_identity_ids, row['round_id'])
+                keys = [f"ticket_new|{umo}|{identity}" for identity in identity_ids]
+                key = keys[0]
                 payload = f"#{row.get('public_number') or '?'} {row['title']}｜{row['name']}｜{status}"
-                if await asyncio.to_thread(self.db.claim_delivery, key, umo, payload, "ticket_new"):
+                if await asyncio.to_thread(self.db.claim_delivery, key, umo, payload, "ticket_new", keys[1:]):
                     selected.append({"delivery_key": key, "notification_type": "ticket_new", "umo": umo,
                                      "title": row["title"], "brands": json.loads(row["brands_json"]),
                                      "public_number": row.get("public_number"), "subtitle": subtitle,

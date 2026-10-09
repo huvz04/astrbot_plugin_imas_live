@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from .models import CastAppearance, Performance, TicketRound
 from .cms import event_root
+from .parsing import canonical_reception_url, stable
 
 
 def now() -> str:
@@ -126,6 +127,9 @@ class Database:
               round_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, source_url TEXT NOT NULL,
               observed_at TEXT NOT NULL, FOREIGN KEY(event_id) REFERENCES events(id)
             );
+            CREATE TABLE IF NOT EXISTS ticket_round_aliases (
+              alias_id TEXT PRIMARY KEY, round_id TEXT NOT NULL
+            );
             """)
             if not any(row['name'] == 'notification_type' for row in db.execute('PRAGMA table_info(delivery_log)')):
                 db.execute("ALTER TABLE delivery_log ADD COLUMN notification_type TEXT NOT NULL DEFAULT 'legacy'")
@@ -153,6 +157,7 @@ class Database:
                 db.execute("""UPDATE ticket_rounds SET verified_source_url=COALESCE(
                     (SELECT e.official_url FROM events e JOIN sources s ON s.event_id=e.id AND s.url=e.official_url
                      WHERE e.id=ticket_rounds.event_id),source_url)""")
+            self._normalize_ticket_identities(db)
             # Upgrade existing installations before their next directory sync.
             # First assignment prefers the nearest dated performance, then
             # stable creation/ID ordering; it is never used as a live ranking.
@@ -163,6 +168,51 @@ class Database:
                     MIN(CASE WHEN p.date>=date('now') THEN p.date END),e.created_at,e.id""").fetchall()
             for row in missing:
                 db.execute("INSERT INTO event_numbers(event_id,public_number) VALUES(?, COALESCE((SELECT MAX(public_number)+1 FROM event_numbers),1))", (row["id"],))
+
+    @staticmethod
+    def _merge_ticket_identity(db, target_id: str, rows: list[dict[str, Any]]) -> None:
+        """Keep one real entrance, retaining old notification identities as aliases."""
+        winner = max(rows, key=lambda r: (
+            bool(r.get('application_start') and r.get('application_end')),
+            r.get('verification_quality') == 'verified', r.get('verified_at') or '', r['id'] == target_id))
+        record = {**winner, 'id': target_id}
+        record['url'] = canonical_reception_url(record['url']) or record['url']
+        record['performance_keys_json'] = json.dumps(list(dict.fromkeys(
+            key for row in rows for key in json.loads(row.get('performance_keys_json') or '[]'))))
+        columns = list(record)
+        db.execute(f"INSERT INTO ticket_rounds ({','.join(columns)}) VALUES({','.join('?' for _ in columns)}) "
+                   f"ON CONFLICT(id) DO UPDATE SET {','.join(c+'=excluded.'+c for c in columns if c != 'id')}",
+                   [record[c] for c in columns])
+        old_ids = [r['id'] for r in rows if r['id'] != target_id]
+        for old_id in old_ids:
+            db.execute('UPDATE ticket_round_aliases SET round_id=? WHERE round_id=?', (target_id, old_id))
+            db.execute('INSERT OR REPLACE INTO ticket_round_aliases VALUES(?,?)', (old_id, target_id))
+            # Carry the original observation time; migration never announces history.
+            pending = db.execute('SELECT * FROM ticket_new_rounds WHERE round_id=?', (old_id,)).fetchone()
+            if pending:
+                db.execute('''INSERT INTO ticket_new_rounds VALUES(?,?,?,?) ON CONFLICT(round_id) DO UPDATE SET
+                    observed_at=MIN(ticket_new_rounds.observed_at,excluded.observed_at)''',
+                    (target_id, pending['event_id'], pending['source_url'], pending['observed_at']))
+            db.execute('DELETE FROM ticket_new_rounds WHERE round_id=?', (old_id,))
+            db.execute('DELETE FROM ticket_rounds WHERE id=?', (old_id,))
+
+    def _normalize_ticket_identities(self, db, event_id: str | None = None) -> None:
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        query = 'SELECT * FROM ticket_rounds' + (' WHERE event_id=?' if event_id else '')
+        for raw in db.execute(query, (event_id,) if event_id else ()).fetchall():
+            row = dict(raw)
+            reception = canonical_reception_url(row['url'])
+            if reception:
+                groups.setdefault((row['event_id'], reception), []).append(row)
+        for (event, reception), rows in groups.items():
+            target_id = event + ':' + stable(reception)
+            if len(rows) > 1 or rows[0]['id'] != target_id or rows[0]['url'] != reception:
+                self._merge_ticket_identity(db, target_id, rows)
+
+    def ticket_identity_ids(self, round_id: str) -> list[str]:
+        with self._connect() as db:
+            aliases = [r[0] for r in db.execute('SELECT alias_id FROM ticket_round_aliases WHERE round_id=?', (round_id,))]
+        return [round_id, *aliases]
 
     def upsert_event(self, item: dict[str, Any], discovered_after_baseline: bool = False) -> bool:
         stamp = now()
@@ -197,6 +247,25 @@ class Database:
         tickets, performances, cast = list(tickets), list(performances), list(cast)
         performances = self._unique_performances(event_id, source_url, performances)
         with self._connect() as db:
+            self._normalize_ticket_identities(db, event_id)
+            for row in tickets:
+                reception = canonical_reception_url(row.url)
+                if reception:
+                    row.url, row.stable_key = reception, stable(reception)
+            # Earlier accordion parsing stole a sibling's title for the game-only
+            # entrance. Match its exact source/block evidence, not just a period.
+            linked_names = {row.name for row in tickets if row.url}
+            for row in tickets:
+                if row.url or not row.evidence or not row.evidence.excerpt:
+                    continue
+                legacy = [dict(r) for r in db.execute('''SELECT * FROM ticket_rounds WHERE event_id=? AND url IS NULL
+                    AND source_url=? AND excerpt=? AND application_start IS ? AND application_end IS ?''',
+                    (event_id, row.evidence.url, row.evidence.excerpt, row.application_start, row.application_end))
+                    if r['name'] in linked_names and r['name'] != row.name]
+                if len(legacy) == 1:
+                    target_id = event_id + ':' + row.stable_key
+                    current = db.execute('SELECT * FROM ticket_rounds WHERE id=?', (target_id,)).fetchone()
+                    self._merge_ticket_identity(db, target_id, legacy + ([dict(current)] if current else []))
             existing = db.execute("SELECT content_hash FROM sources WHERE event_id=? AND url=?", (event_id, source_url)).fetchone()
             source_baselined = bool(db.execute("SELECT 1 FROM ticket_source_baselines WHERE event_id=? AND source_url=?", (event_id, source_url)).fetchone())
             prior_ticket_ids = {row["id"] for row in db.execute("SELECT id FROM ticket_rounds WHERE event_id=?", (event_id,))}
@@ -540,9 +609,13 @@ class Database:
             row = db.execute("SELECT enabled FROM group_switches WHERE umo=?", (umo,)).fetchone()
         return bool(row["enabled"]) if row else default
 
-    def claim_delivery(self, key: str, subscription_id: str, payload: str, notification_type: str = "legacy") -> bool:
+    def claim_delivery(self, key: str, subscription_id: str, payload: str, notification_type: str = "legacy",
+                       equivalent_keys: Iterable[str] = ()) -> bool:
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            for alias in equivalent_keys:
+                if db.execute("SELECT 1 FROM delivery_log WHERE dedupe_key=? AND state IN ('sent','inflight')", (alias,)).fetchone():
+                    return False
             row = db.execute("SELECT state FROM delivery_log WHERE dedupe_key=?", (key,)).fetchone()
             if row and row["state"] in ("sent", "inflight"):
                 return False

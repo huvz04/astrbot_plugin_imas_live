@@ -11,7 +11,7 @@ import re
 import unicodedata
 from html import escape
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
@@ -21,7 +21,7 @@ JST = "+09:00"
 SPACE = re.compile(r"\s+")
 DATE = re.compile(
     r"(?:(?P<year>20\d{2})[年./])?(?P<month>\d{1,2})[月./](?P<day>\d{1,2})日?"
-    r"(?:\([^)]*\))?\s*(?P<hour>\d{1,2})[:：](?P<minute>\d{2})"
+    r"\s*(?:\([^)]*\))?\s*(?P<hour>\d{1,2})[:：](?P<minute>\d{2})"
 )
 DAY_DATE = re.compile(r"(?:(?P<year>20\d{2})[年./])?(?P<month>\d{1,2})[月./](?P<day>\d{1,2})日?")
 YEAR = re.compile(r"(20\d{2})[年./]")
@@ -70,6 +70,18 @@ def _page_soup(html: str) -> BeautifulSoup:
 
 def stable(*values: str) -> str:
     return hashlib.sha256("\x1f".join(values).encode()).hexdigest()[:24]
+
+
+def canonical_reception_url(url: str | None) -> str | None:
+    """Only ASOBI reception paths have a verified query-independent identity."""
+    try:
+        parts = urlsplit(url or '')
+    except ValueError:
+        return None
+    match = re.fullmatch(r'/receptions/([^/]+)/?', parts.path)
+    if parts.scheme in {'http', 'https'} and parts.hostname == 'asobiticket2.asobistore.jp' and match:
+        return 'https://asobiticket2.asobistore.jp/receptions/' + match.group(1)
+    return None
 
 
 def japan_datetime(value: str, inherited_year: int | None = None) -> str | None:
@@ -129,9 +141,22 @@ def _nearest_title(node: Tag) -> str:
         heading = node.find("summary", recursive=False)
         if heading:
             return clean(heading.get_text(" "))
+    branch = node
+    for ancestor in node.parents:
+        if ancestor.name in {'details', 'dl', 'section'}:
+            break
+        if ancestor.name == 'div':
+            heading = ancestor.find(['h2', 'h3', 'h4'], recursive=False)
+            if heading and any(s is heading for s in branch.previous_siblings) and _method(clean(heading.get_text(' '))) != 'unknown':
+                return clean(heading.get_text(' '))
+        branch = ancestor
     accordion = node.find_parent('dl', class_=lambda value: value in {'accordionList', 'accordion', 'c-accordion'})
     if accordion:
-        heading = accordion.find("dt", recursive=False)
+        owner = node
+        while owner.parent is not accordion:
+            owner = owner.parent
+        heading = owner.find_previous_sibling('dt') if owner.name == 'dd' else None
+        heading = heading if heading is not None else accordion.find("dt", recursive=False)
         if heading:
             return clean(heading.get_text(" "))
     accordion = node.find_parent(class_='p-ticket__accordion')
@@ -269,6 +294,9 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         # receptions. Their recursive dt/dd traversal would mix deadlines.
         if node.select_one("details"):
             continue
+        if sum(any(label in clean(dt.get_text(' ')) for label in ('受付期間', '申込期間', '販売期間'))
+               for dt in node.select('dt')) > 1:
+            continue  # A broad wrapper must not mix several field-owning receptions.
         pairs = _pairs(node)
         period = _field(pairs, "受付期間", "申込期間", "販売期間")
         ticket_url = _field(pairs, "受付URL", "販売URL")
@@ -299,6 +327,7 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
             membership_notes = [note for note in notes if "会員" in note]
             eligibility = " ".join(membership_notes) or None
         for url in urls:
+            url = canonical_reception_url(url) or url
             # Distinct official reception links (e.g. VIP and normal seats)
             # must survive; date edits never change their identities.
             key = stable(url) if url else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
@@ -353,6 +382,7 @@ def parse_ticket_news(html: str, source_url: str) -> list[TicketRound]:
             continue
         pay_start, pay_end = _range(fields.get('入金期間'))
         for link in links:
+            link = canonical_reception_url(link) or link
             row = TicketRound(stable(link), title, 'onsite', _method(title), start, end,
                               result_at=japan_datetime(fields.get('当落発表', '')),
                               payment_start=pay_start, payment_end=pay_end, url=link,
