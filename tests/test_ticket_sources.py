@@ -145,7 +145,15 @@ class TicketSourceWorkflow(unittest.IsolatedAsyncioTestCase):
         self.service.client.live_articles = AsyncMock(return_value=[CmsArticle('999', 'noctchill LIVE', found['official_url'], [], '2027年3月27日', None, None, {})])
         self.service._refresh_article = AsyncMock(return_value=False)
         await self.service.sync()
-        self.assertIsNone(self.service.db.detail('999'))
+        # URL-only news identities are provisional, not proof that an arbitrary
+        # CMS city/event belongs to that record. Promote only after both pages
+        # provide identical complete sessions and venue evidence.
+        self.assertIsNotNone(self.service.db.detail('999'))
+        for event_id in [found['id'], '999']:
+            self.service.db.save_parsed(event_id, found['official_url'], 'full', 'test', [], [
+                Performance('day', '2027-03-27', '开演 13:00 JST', 'ゼビオアリーナ仙台',
+                    evidence=Evidence(found['official_url'], 'official', 'test'))], [], [])
+        self.assertEqual(self.service.db.detail('999')['event']['id'], found['id'])
         self.assertEqual(self.service.db.detail(found['id'])['event']['public_number'], number)
 
     async def test_failed_initial_news_is_retried_without_historical_discovery_alert(self):

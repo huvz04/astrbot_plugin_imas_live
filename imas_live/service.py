@@ -103,8 +103,6 @@ class ImasLiveService:
                 if full_directory:
                     articles = await self.client.live_articles(int(self.config.get("max_pages", 30)))
                     controlled_by_url = {_canonical_event_url(source.url): source for source in VERIFIED_EVENT_SOURCES}
-                    discovered = {_canonical_event_url(row['official_url']): row for row in self.db.list_events(limit=10000)
-                                  if row['id'].startswith('news:')}
                     normalized = []
                     known_urls = set()
                     for article in articles:
@@ -117,8 +115,6 @@ class ImasLiveService:
                                                  article.brands or controlled.brands, article.event_display,
                                                  article.venue or controlled.venue, article.updated,
                                                  {**article.raw, "controlled_source": True})
-                        elif url_key in discovered:
-                            article.cms_id = discovered[url_key]['id']
                         if controlled and url_key in known_urls:
                             continue
                         normalized.append(article)
@@ -152,6 +148,7 @@ class ImasLiveService:
                 await asyncio.to_thread(self.db.upsert_event, self._event_record(article),
                                         full_directory and directory_was_complete and is_live and not excluded
                                         and not article.raw.get("controlled_source"))
+                article.cms_id = await asyncio.to_thread(self.db.resolve_event_id, article.cms_id)
                 if full_directory:
                     # These are date entries from the official event field, never range expansion.
                     dates = schedule_performances(article.event_display or '', article.url or f'https://idolmaster-official.jp/live_event#event-{article.cms_id}', article.venue, True) if is_live and not excluded else []
@@ -205,7 +202,9 @@ class ImasLiveService:
         baseline = self._ticket_moment(self.db.meta('news_discovery_baseline'))
         try:
             news = await self.client.recent_news()
-            existing = {_canonical_event_url(row['official_url']): row for row in self.db.list_events(limit=10000)}
+            existing: dict[str, list[dict]] = {}
+            for row in self.db.list_events(limit=10000):
+                existing.setdefault(_canonical_event_url(row['official_url']), []).append(row)
             attempted = 0
             errors = []
             for item in news:
@@ -235,7 +234,12 @@ class ImasLiveService:
                     if not root:
                         continue
                     key = _canonical_event_url(root)
-                    row = existing.get(key)
+                    matches = existing.get(key, [])
+                    if len(matches) > 1:
+                        # One page can represent several tour cities. News
+                        # alone cannot choose which event owns a reception.
+                        continue
+                    row = matches[0] if matches else None
                     if row is None:
                         brands = [str(b['code']) for b in item.get('brand', []) if isinstance(b, dict) and b.get('code')]
                         article = CmsArticle('news:' + hashlib.sha256(key.encode()).hexdigest()[:16], title,
@@ -246,12 +250,12 @@ class ImasLiveService:
                             news_updated = None
                         self.db.upsert_event(self._event_record(article), bool(
                             baseline and news_updated and news_updated > baseline))
-                        row = {'id': article.cms_id, 'official_url': root}
-                        existing[key] = row
+                        row = {'id': self.db.resolve_event_id(article.cms_id), 'official_url': root}
+                        existing[key] = [row]
                     self.db.set_meta('refresh_hint:' + row['id'], stamp)
-                if len(roots) == 1:
+                if len(roots) == 1 and len(existing.get(_canonical_event_url(next(iter(roots))), [])) == 1:
                     root = next(iter(roots))
-                    event = existing[_canonical_event_url(root)]
+                    event = existing[_canonical_event_url(root)][0]
                     news_url = 'https://idolmaster-official.jp/news/' + page + '.html'
                     rounds = parse_ticket_news(html, news_url)
                     known = {t['id']: t for t in self.db.ticket_query_rows() if t['event_id'] == event['id']}
@@ -1105,9 +1109,12 @@ class ImasLiveService:
                 created = self.db.subscription_created_at("live", umo)
                 if created and created.astimezone(zone) > due:
                     continue
-                key = hashlib.sha256(f"live|{umo}|{row['id']}|{moment.isoformat()}".encode()).hexdigest()
+                identities = await asyncio.to_thread(self.db.performance_identity_ids, row['id'])
+                keys = [hashlib.sha256(f"live|{umo}|{identity}|{moment.isoformat()}".encode()).hexdigest()
+                        for identity in identities]
+                key = keys[0]
                 text = f"#{row.get('public_number') or '?'} {row['title']}｜北京时间 {moment:%Y/%m/%d %H:%M} 开演"
-                if await asyncio.to_thread(self.db.claim_delivery, key, umo, text):
+                if await asyncio.to_thread(self.db.claim_delivery, key, umo, text, 'legacy', keys[1:]):
                     selected.append({"delivery_key": key, "umo": umo, "title": row["title"],
                                      "brands": json.loads(row["brands_json"]), "public_number": row.get("public_number"),
                                      "subtitle": f"北京时间 {moment:%Y/%m/%d %H:%M} 开演｜{row.get('session_label') or ''}",

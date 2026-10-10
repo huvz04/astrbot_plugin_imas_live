@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
+import unicodedata
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from .models import CastAppearance, Performance, TicketRound
 from .cms import event_root
-from .parsing import canonical_reception_url, stable
+from .parsing import canonical_reception_url, schedule_performances, stable
+
+logger = logging.getLogger(__name__)
 
 
 def now() -> str:
@@ -24,6 +30,7 @@ class Database:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
+        self.reconcile_event_identities()
 
     @contextmanager
     def _connect(self):
@@ -130,6 +137,17 @@ class Database:
             CREATE TABLE IF NOT EXISTS ticket_round_aliases (
               alias_id TEXT PRIMARY KEY, round_id TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_aliases (
+              alias_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, public_number INTEGER UNIQUE,
+              FOREIGN KEY(event_id) REFERENCES events(id)
+            );
+            CREATE TABLE IF NOT EXISTS performance_aliases (
+              alias_id TEXT PRIMARY KEY, performance_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS event_merge_audit (
+              alias_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, merged_at TEXT NOT NULL,
+              backup_path TEXT NOT NULL, evidence_json TEXT NOT NULL
+            );
             """)
             if not any(row['name'] == 'notification_type' for row in db.execute('PRAGMA table_info(delivery_log)')):
                 db.execute("ALTER TABLE delivery_log ADD COLUMN notification_type TEXT NOT NULL DEFAULT 'legacy'")
@@ -167,7 +185,8 @@ class Database:
                 ORDER BY MIN(CASE WHEN p.date>=date('now') THEN p.date END) IS NULL,
                     MIN(CASE WHEN p.date>=date('now') THEN p.date END),e.created_at,e.id""").fetchall()
             for row in missing:
-                db.execute("INSERT INTO event_numbers(event_id,public_number) VALUES(?, COALESCE((SELECT MAX(public_number)+1 FROM event_numbers),1))", (row["id"],))
+                db.execute('''INSERT INTO event_numbers(event_id,public_number) VALUES(?, COALESCE((SELECT MAX(public_number)+1 FROM
+                    (SELECT public_number FROM event_numbers UNION ALL SELECT public_number FROM event_aliases)),1))''', (row['id'],))
 
     @staticmethod
     def _merge_ticket_identity(db, target_id: str, rows: list[dict[str, Any]]) -> None:
@@ -214,9 +233,234 @@ class Database:
             aliases = [r[0] for r in db.execute('SELECT alias_id FROM ticket_round_aliases WHERE round_id=?', (round_id,))]
         return [round_id, *aliases]
 
+    @staticmethod
+    def _identity_text(value: Any) -> str:
+        return re.sub(r'\s+', '', unicodedata.normalize('NFKC', str(value or ''))).casefold()
+
+    @staticmethod
+    def _identity_url(value: str | None) -> str:
+        parts = urlsplit(value or '')
+        # Exact official page, not event_root(): a shared tour root or news
+        # article is not an event identity. Only tracking/trailing slash differ.
+        if parts.scheme.lower() != 'https' or parts.netloc.lower() != 'idolmaster-official.jp':
+            return ''
+        if not re.match(r'^/(live_events?|lp)/[^/]+/?$', parts.path):
+            return ''
+        return 'https://idolmaster-official.jp' + parts.path.rstrip('/')
+
+    @staticmethod
+    def _resolve_event_id(db, event_id: str) -> str:
+        alias = db.execute('SELECT event_id FROM event_aliases WHERE alias_id=?', (event_id,)).fetchone()
+        return alias['event_id'] if alias else event_id
+
+    def resolve_event_id(self, event_id: str) -> str:
+        with self._connect() as db:
+            return self._resolve_event_id(db, event_id)
+
+    def _event_scope(self, db, item: dict[str, Any]) -> tuple[set, set, set, bool, set]:
+        rows = [dict(r) for r in db.execute(
+            "SELECT * FROM performances WHERE event_id=? AND status!='cancelled' AND date IS NOT NULL", (item['id'],))]
+        if not rows:
+            rows = [dict(date=p.date, session_label=p.session_label, venue=p.venue, status=p.status)
+                    for p in schedule_performances(item.get('event_display') or '',
+                        item.get('official_url') or item.get('url') or '', item.get('venue'), True)]
+        dates = {r['date'] for r in rows}
+        venues = {self._identity_text(r.get('venue')) for r in rows if r.get('venue')}
+        if not venues and item.get('venue'):
+            venues.add(self._identity_text(item['venue']))
+        sessions = {(r['date'], self._identity_text(r.get('session_label')), self._identity_text(r.get('venue')))
+                    for r in rows if r.get('status') != 'directory'}
+        clocks = {(r['date'], m.group(0)) for r in rows for m in re.finditer(r'\d{1,2}:\d{2}', r.get('session_label') or '')}
+        return dates, venues, sessions, bool(rows) and all(r.get('status') != 'directory' for r in rows), clocks
+
+    def _same_event(self, db, left: dict, right: dict) -> bool:
+        page = self._identity_url(left.get('official_url') or left.get('url'))
+        if not page or page != self._identity_url(right.get('official_url') or right.get('url')):
+            return False
+        ld, lv, ls, lp, lc = self._event_scope(db, left)
+        rd, rv, rs, rp, rc = self._event_scope(db, right)
+        # No missing-date/venue inference, subset matching or fuzzy city names.
+        if not ld or ld != rd or not lv or lv != rv:
+            return False
+        if lc and rc and lc != rc:
+            return False
+        if lp and rp and ls != rs:
+            return False
+        titles_match = self._identity_text(left['title']) == self._identity_text(right['title'])
+        # News discovery temporarily stores a headline, not the event's title.
+        # Promotion requires BOTH full, identical parsed session rosters.
+        provisional = left['id'].startswith('news:') != right['id'].startswith('news:')
+        return titles_match or (provisional and lp and rp and bool(ls) and ls == rs)
+
+    def performance_identity_ids(self, performance_id: str) -> list[str]:
+        with self._connect() as db:
+            aliases = [r[0] for r in db.execute(
+                'SELECT alias_id FROM performance_aliases WHERE performance_id=?', (performance_id,))]
+        return [performance_id, *aliases]
+
+    @staticmethod
+    def _alias_performance(db, old_id: str, target_id: str) -> None:
+        if old_id != target_id:
+            db.execute('DELETE FROM performance_aliases WHERE alias_id=?', (target_id,))
+            db.execute('UPDATE performance_aliases SET performance_id=? WHERE performance_id=?', (target_id, old_id))
+            db.execute('INSERT OR REPLACE INTO performance_aliases VALUES(?,?)', (old_id, target_id))
+
+    def reconcile_event_identities(self) -> int:
+        """Back up and merge only strongly confirmed duplicates, atomically.
+
+        No schema-version shortcut: a later official ID change can introduce
+        another duplicate. Aliases prevent known IDs from ever being reborn.
+        """
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows = [dict(r) for r in db.execute('''SELECT e.*,n.public_number FROM events e
+                LEFT JOIN event_numbers n ON n.event_id=e.id ORDER BY n.public_number,e.created_at,e.id''')]
+            groups: dict[str, list[dict]] = {}
+            pairs = []
+            for row in rows:
+                key = self._identity_url(row['official_url'])
+                if not key:
+                    continue
+                matches = [other for other in groups.get(key, []) if self._same_event(db, other, row)]
+                if len(matches) == 1:
+                    pairs.append((matches[0], row))
+                else:
+                    groups.setdefault(key, []).append(row)
+            if not pairs:
+                return 0
+            backup_path = self.path.with_name(self.path.stem + '.before-event-merge-' + uuid.uuid4().hex + '.sqlite3')
+            # A separate read connection sees the last committed database while
+            # BEGIN IMMEDIATE prevents another writer changing the merge plan.
+            with sqlite3.connect(self.path) as source, sqlite3.connect(backup_path) as backup:
+                source.backup(backup)
+            for winner, duplicate in pairs:
+                self._merge_event(db, winner, duplicate)
+                db.execute('INSERT INTO event_merge_audit VALUES(?,?,?,?,?)', (
+                    duplicate['id'], winner['id'], now(), str(backup_path),
+                    json.dumps({'retained': winner, 'duplicate': duplicate}, ensure_ascii=False)))
+            db.execute("INSERT INTO meta VALUES('event_identity_last_backup',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (str(backup_path),))
+        logger.warning('IM@S confirmed event duplicates merged: count=%s backup=%s', len(pairs), backup_path)
+        return len(pairs)
+
+    def _merge_event(self, db, winner: dict, duplicate: dict) -> None:
+        target, old = winner['id'], duplicate['id']
+        db.execute('UPDATE event_aliases SET event_id=? WHERE event_id=?', (target, old))
+        db.execute('INSERT INTO event_aliases VALUES(?,?,?)', (old, target, duplicate['public_number']))
+        # Keep the early public number, but prefer the CMS event title over a
+        # provisional news headline after full parsed evidence has confirmed it.
+        if target.startswith('news:') and not old.startswith('news:'):
+            db.execute('UPDATE events SET title=?,brands_json=? WHERE id=?', (duplicate['title'], duplicate['brands_json'], target))
+        performance_map = {}
+        for raw in db.execute('SELECT * FROM performances WHERE event_id=?', (old,)).fetchall():
+            row = dict(raw)
+            candidates = [dict(r) for r in db.execute('SELECT * FROM performances WHERE event_id=?', (target,))]
+            match = next((r for r in candidates if all(self._identity_text(r[k]) == self._identity_text(row[k])
+                         for k in ('date', 'session_label', 'venue'))), None)
+            new_id = match['id'] if match else target + ':' + row['id'][len(old)+1:]
+            if not match:
+                if db.execute('SELECT 1 FROM performances WHERE id=?', (new_id,)).fetchone():
+                    new_id = target + ':merged:' + stable(row['id'])
+                db.execute('UPDATE performances SET id=?,event_id=? WHERE id=?', (new_id, target, row['id']))
+            else:
+                if match['status'] == 'directory' and row['status'] != 'directory':
+                    db.execute('''UPDATE performances SET status=?,precision=?,source_url=?,excerpt=? WHERE id=?''',
+                        (row['status'], row['precision'], row['source_url'], row['excerpt'], new_id))
+                db.execute('DELETE FROM performances WHERE id=?', (row['id'],))
+            performance_map[row['id']] = new_id
+            self._alias_performance(db, row['id'], new_id)
+        db.execute('UPDATE ticket_new_rounds SET event_id=? WHERE event_id=?', (target, old))
+        for raw in db.execute('SELECT * FROM ticket_rounds WHERE event_id=?', (old,)).fetchall():
+            row = dict(raw)
+            row['event_id'] = target
+            keys = json.loads(row.get('performance_keys_json') or '[]')
+            row['performance_keys_json'] = json.dumps([performance_map.get(k, performance_map.get(old+':'+k, k))
+                                                       for k in keys])
+            reception = canonical_reception_url(row['url'])
+            existing = [dict(r) for r in db.execute('SELECT * FROM ticket_rounds WHERE event_id=?', (target,))]
+            match = next((r for r in existing if self._same_ticket_entry(r, row, old)), None)
+            new_id = (target + ':' + stable(reception)) if reception else (
+                match['id'] if match else target + ':' + row['id'][len(old)+1:])
+            if not match and db.execute('SELECT 1 FROM ticket_rounds WHERE id=?', (new_id,)).fetchone():
+                new_id = target + ':merged:' + stable(row['id'])
+            self._merge_ticket_identity(db, new_id, [row] + ([match] if match else []))
+        for raw in db.execute('SELECT * FROM cast_appearances WHERE event_id=?', (old,)).fetchall():
+            row = dict(raw)
+            performance = row['performance_id']
+            performance = performance_map.get(performance, performance_map.get(old+':'+str(performance), performance))
+            if performance and performance.startswith(target+':'):
+                performance = performance[len(target)+1:]
+            existing_cast = db.execute('''SELECT 1 FROM cast_appearances WHERE event_id=? AND
+                (performance_id IS ? OR performance_id=?) AND person_name=? AND role_name IS ?''',
+                (target, performance, target+':'+str(performance) if performance else None, row['person_name'], row['role_name'])).fetchone()
+            if existing_cast:
+                continue
+            db.execute('INSERT OR IGNORE INTO cast_appearances VALUES(?,?,?,?,?,?,?,?)', (
+                f"{target}:{performance or 'unknown'}:{row['person_name']}:{row['role_name'] or ''}", target,
+                performance, row['person_name'], row['role_name'], row['status'], row['source_url'], row['excerpt']))
+        db.execute('DELETE FROM cast_appearances WHERE event_id=?', (old,))
+        for raw in db.execute('SELECT * FROM sources WHERE event_id=?', (old,)).fetchall():
+            row = dict(raw)
+            other = db.execute('SELECT * FROM sources WHERE event_id=? AND url=?', (target, row['url'])).fetchone()
+            if other and (other['attempted_at'] or other['fetched_at']) >= (row['attempted_at'] or row['fetched_at']):
+                continue
+            row['event_id'] = target
+            columns = list(row)
+            db.execute(f"INSERT OR REPLACE INTO sources ({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                       [row[c] for c in columns])
+        db.execute('DELETE FROM sources WHERE event_id=?', (old,))
+        db.execute('''INSERT INTO ticket_source_baselines SELECT ?,source_url,baselined_at FROM ticket_source_baselines WHERE event_id=?
+            ON CONFLICT(event_id,source_url) DO UPDATE SET baselined_at=MIN(baselined_at,excluded.baselined_at)''', (target, old))
+        db.execute('DELETE FROM ticket_source_baselines WHERE event_id=?', (old,))
+        db.execute('''INSERT INTO ticket_new_event_discoveries SELECT ?,discovered_at,initial_ticket_notice_recorded
+            FROM ticket_new_event_discoveries WHERE event_id=? ON CONFLICT(event_id) DO UPDATE SET
+            discovered_at=MIN(discovered_at,excluded.discovered_at),
+            initial_ticket_notice_recorded=MAX(initial_ticket_notice_recorded,excluded.initial_ticket_notice_recorded)''', (target, old))
+        db.execute('''UPDATE ticket_new_event_discoveries SET initial_ticket_notice_recorded=1 WHERE event_id=?
+            AND EXISTS(SELECT 1 FROM ticket_source_baselines WHERE event_id=?)''', (target, target))
+        db.execute('DELETE FROM ticket_new_event_discoveries WHERE event_id=?', (old,))
+        db.execute('''INSERT OR IGNORE INTO cast_assets SELECT ?,image_url,cached_path,source_url,fetched_at
+            FROM cast_assets WHERE event_id=?''', (target, old))
+        db.execute('DELETE FROM cast_assets WHERE event_id=?', (old,))
+        db.execute('''INSERT OR IGNORE INTO review_items(event_id,source_url,note,state,observed_at)
+            SELECT ?,source_url,note,state,observed_at FROM review_items WHERE event_id=?''', (target, old))
+        db.execute('DELETE FROM review_items WHERE event_id=?', (old,))
+        db.execute('''INSERT INTO meta SELECT ?,value FROM meta WHERE key=? ON CONFLICT(key) DO UPDATE SET
+            value=MAX(value,excluded.value)''', ('refresh_hint:'+target, 'refresh_hint:'+old))
+        db.execute('DELETE FROM meta WHERE key=?', ('refresh_hint:'+old,))
+        db.execute('DELETE FROM event_numbers WHERE event_id=?', (old,))
+        db.execute('DELETE FROM events WHERE id=?', (old,))
+
+    def _same_unlinked_evidence(self, left: dict, right: dict, right_event_id: str | None = None) -> bool:
+        def page(value):
+            parts = urlsplit(value or '')
+            return (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip('/'))
+        same_key = left['id'][len(left['event_id'])+1:] == right['id'][len(right_event_id or right['event_id'])+1:]
+        excerpt = self._identity_text(left.get('excerpt'))
+        same_excerpt = bool(excerpt) and excerpt == self._identity_text(right.get('excerpt'))
+        return bool(left.get('source_url') and right.get('source_url')) and page(left['source_url']) == page(right['source_url']) and (same_key or same_excerpt)
+
+    def _same_ticket_entry(self, left: dict, right: dict, right_event_id: str | None = None) -> bool:
+        receipt = canonical_reception_url(left.get('url'))
+        if receipt:
+            return receipt == canonical_reception_url(right.get('url'))
+        fields = ('name', 'ticket_scope', 'sale_method', 'application_start', 'application_end',
+                  'result_at', 'payment_start', 'payment_end', 'seats', 'eligibility')
+        return not left.get('url') and not right.get('url') and all(left[k] == right[k] for k in fields) and \
+            self._same_unlinked_evidence(left, right, right_event_id)
+
     def upsert_event(self, item: dict[str, Any], discovered_after_baseline: bool = False) -> bool:
         stamp = now()
+        item = dict(item)
         with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            requested = str(item['id'])
+            item['id'] = self._resolve_event_id(db, requested)
+            if item['id'] == requested and not db.execute('SELECT 1 FROM events WHERE id=?', (requested,)).fetchone():
+                matches = [dict(r) for r in db.execute('SELECT * FROM events') if self._same_event(db, dict(r), item)]
+                if len(matches) == 1:
+                    item['id'] = matches[0]['id']
+                    db.execute('INSERT INTO event_aliases VALUES(?,?,NULL)', (requested, item['id']))
             is_new = not bool(db.execute("SELECT 1 FROM events WHERE id=?", (item["id"],)).fetchone())
             db.execute("""INSERT INTO events(id,title,brands_json,official_url,event_display,venue,source_updated,created_at,updated_at)
                 VALUES(:id,:title,:brands,:url,:display,:venue,:updated,:stamp,:stamp)
@@ -229,7 +473,8 @@ class Database:
             })
             # SQLite serializes writers, making MAX()+1 safe in this transaction.
             db.execute("""INSERT OR IGNORE INTO event_numbers(event_id,public_number)
-                VALUES(?, COALESCE((SELECT MAX(public_number) + 1 FROM event_numbers), 1))""", (item["id"],))
+                VALUES(?, COALESCE((SELECT MAX(public_number) + 1 FROM
+                  (SELECT public_number FROM event_numbers UNION ALL SELECT public_number FROM event_aliases)), 1))""", (item["id"],))
             if is_new and discovered_after_baseline:
                 db.execute("""INSERT OR IGNORE INTO ticket_new_event_discoveries(event_id,discovered_at)
                     VALUES(?,?)""", (item["id"], stamp))
@@ -247,11 +492,26 @@ class Database:
         tickets, performances, cast = list(tickets), list(performances), list(cast)
         performances = self._unique_performances(event_id, source_url, performances)
         with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
             self._normalize_ticket_identities(db, event_id)
             for row in tickets:
                 reception = canonical_reception_url(row.url)
                 if reception:
                     row.url, row.stable_key = reception, stable(reception)
+                elif not row.url:
+                    # Trailing-slash/CMS ID changes can change source-derived
+                    # keys even though an unlinked application is unchanged.
+                    # Require exact business facts AND matching page evidence.
+                    incoming = {**row.record(), 'id': event_id+':'+row.stable_key, 'event_id': event_id,
+                        'source_url': row.evidence.url if row.evidence else source_url,
+                        'excerpt': row.evidence.excerpt if row.evidence else ''}
+                    matches = [dict(r) for r in db.execute('SELECT * FROM ticket_rounds WHERE event_id=? AND url IS NULL', (event_id,))
+                               if self._same_ticket_entry(dict(r), incoming)]
+                    if len(matches) == 1:
+                        retained_id = matches[0]['id']
+                        if incoming['id'] != retained_id:
+                            db.execute('INSERT OR REPLACE INTO ticket_round_aliases VALUES(?,?)', (incoming['id'], retained_id))
+                            row.stable_key = retained_id[len(event_id)+1:]
             # Earlier accordion parsing stole a sibling's title for the game-only
             # entrance. Match its exact source/block evidence, not just a period.
             linked_names = {row.name for row in tickets if row.url}
@@ -294,6 +554,21 @@ class Database:
                        (source_url, content_hash, stamp, f"{parser} changed"))
             # Upsert current rounds without removing history; stable IDs survive deadline edits.
             if performances:
+                replacements = {}
+                for previous in db.execute('SELECT * FROM performances WHERE event_id=?', (event_id,)).fetchall():
+                    replacement = next((p for p in performances if
+                        (self._identity_text(p.date), self._identity_text(p.session_label), self._identity_text(p.venue)) ==
+                        tuple(self._identity_text(previous[k]) for k in ('date', 'session_label', 'venue'))), None)
+                    if replacement:
+                        new_id = event_id+':'+replacement.stable_key
+                        replacements[previous['id']] = new_id
+                        replacements[previous['id'][len(event_id)+1:]] = new_id
+                        self._alias_performance(db, previous['id'], new_id)
+                for ticket in db.execute('SELECT id,performance_keys_json FROM ticket_rounds WHERE event_id=?', (event_id,)).fetchall():
+                    keys = json.loads(ticket['performance_keys_json'] or '[]')
+                    updated = [replacements.get(key, key) for key in keys]
+                    if updated != keys:
+                        db.execute('UPDATE ticket_rounds SET performance_keys_json=? WHERE id=?', (json.dumps(updated), ticket['id']))
                 db.execute("DELETE FROM performances WHERE event_id=?", (event_id,))
             if not ticket_only:
                 db.execute("DELETE FROM cast_appearances WHERE event_id=?", (event_id,))
@@ -339,11 +614,23 @@ class Database:
                         WHERE event_id=?""", (event_id,))
             else:
                 candidate_ids = set(current_tickets) - prior_ticket_ids
+            if candidate_ids:
+                # A CMS ID first seen without dates may only become provably
+                # duplicate after this parse. Do not queue its already-known
+                # entrances as new announcements before post-commit merging.
+                this_event = dict(db.execute('SELECT * FROM events WHERE id=?', (event_id,)).fetchone())
+                duplicates = [dict(r) for r in db.execute('SELECT * FROM events WHERE id!=?', (event_id,))
+                              if self._same_event(db, this_event, dict(r))]
+                known_entrances = [dict(t) for other in duplicates for t in db.execute(
+                    'SELECT * FROM ticket_rounds WHERE event_id=?', (other['id'],))]
+                candidate_ids = {key for key in candidate_ids if not any(self._same_ticket_entry(old,
+                    dict(db.execute('SELECT * FROM ticket_rounds WHERE id=?', (key,)).fetchone())) for old in known_entrances)}
             for round_id in candidate_ids:
                 row = current_tickets[round_id]
                 if row.ticket_scope == "onsite" and row.sale_method == "lottery":
                     db.execute("""INSERT OR IGNORE INTO ticket_new_rounds(round_id,event_id,source_url,observed_at)
                         VALUES(?,?,?,?)""", (round_id, event_id, source_url, stamp))
+        self.reconcile_event_identities()
         return True
 
     @staticmethod
@@ -377,6 +664,7 @@ class Database:
 
     def source_error(self, event_id: str, url: str, error: str) -> None:
         with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
             db.execute("""INSERT INTO sources(url,event_id,fetched_at,parser,quality,error) VALUES(?,?,?,'fetch','stale',?)
               ON CONFLICT(event_id,url) DO UPDATE SET quality='stale',error=excluded.error""",
               (url, event_id, now(), error[:500]))
@@ -384,6 +672,7 @@ class Database:
 
     def save_cast_assets(self, event_id: str, source_url: str, assets: Iterable[tuple[str, str]]) -> None:
         with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
             for image_url, cached_path in assets:
                 db.execute("""INSERT INTO cast_assets VALUES(?,?,?,?,?)
                     ON CONFLICT(event_id,image_url) DO UPDATE SET cached_path=excluded.cached_path,
@@ -392,11 +681,13 @@ class Database:
 
     def cast_assets(self, event_id: str) -> list[str]:
         with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
             rows = db.execute("SELECT cached_path FROM cast_assets WHERE event_id=? ORDER BY image_url", (event_id,)).fetchall()
         return [row["cached_path"] for row in rows]
 
     def cast_asset_rows(self, event_id: str) -> list[dict[str, str]]:
         with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
             rows = db.execute("SELECT image_url,cached_path FROM cast_assets WHERE event_id=? ORDER BY image_url", (event_id,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -460,7 +751,7 @@ class Database:
                 'last_news_error': self.meta('last_news_error'), 'last_error': self.meta('last_error')}
 
     def events_by_ids(self, event_ids: Iterable[str]) -> list[dict[str, Any]]:
-        values = list(dict.fromkeys(str(item) for item in event_ids if item))
+        values = list(dict.fromkeys(self.resolve_event_id(str(item)) for item in event_ids if item))
         if not values:
             return []
         placeholders = ",".join("?" for _ in values)
@@ -470,6 +761,7 @@ class Database:
 
     def save_directory_dates(self, event_id: str, rows: list[Performance]) -> None:
         with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
             db.execute("DELETE FROM performances WHERE event_id=? AND status='directory'", (event_id,))
             if db.execute("SELECT 1 FROM performances WHERE event_id=? AND status!='directory' LIMIT 1", (event_id,)).fetchone():
                 return
@@ -491,6 +783,7 @@ class Database:
 
     def detail(self, query: str) -> dict[str, Any] | None:
         with self._connect() as db:
+            query = self._resolve_event_id(db, query)
             event = db.execute("""SELECT e.*,n.public_number,
                 (SELECT MAX(s.fetched_at) FROM sources s WHERE s.event_id=e.id AND s.quality='verified') AS source_fetched_at,
                 (SELECT s.quality FROM sources s WHERE s.event_id=e.id AND s.url=e.official_url LIMIT 1) AS source_quality FROM events e
@@ -505,7 +798,8 @@ class Database:
 
     def detail_by_public_number(self, number: int) -> dict[str, Any] | None:
         with self._connect() as db:
-            row = db.execute("SELECT event_id FROM event_numbers WHERE public_number=?", (number,)).fetchone()
+            row = db.execute('''SELECT event_id FROM event_numbers WHERE public_number=?
+                UNION ALL SELECT event_id FROM event_aliases WHERE public_number=? LIMIT 1''', (number, number)).fetchone()
         return self.detail(row["event_id"]) if row else None
 
     def stats(self, year: str = "", brand: str = "") -> dict[str, Any]:
