@@ -114,6 +114,12 @@ class Database:
               source_url TEXT NOT NULL, fetched_at TEXT NOT NULL,
               PRIMARY KEY(event_id,image_url), FOREIGN KEY(event_id) REFERENCES events(id)
             );
+            CREATE TABLE IF NOT EXISTS event_covers (
+              event_id TEXT PRIMARY KEY, thumbnail_url TEXT, thumbnail_source_url TEXT, thumbnail_cms_id TEXT,
+              image_url TEXT, source_url TEXT, source_kind TEXT, cached_path TEXT, content_hash TEXT,
+              verified_at TEXT, etag TEXT, last_modified TEXT, attempted_at TEXT, attempted_url TEXT, error TEXT,
+              FOREIGN KEY(event_id) REFERENCES events(id)
+            );
             -- A source must be successfully parsed once before its ticket
             -- rounds are eligible for change detection.  This avoids turning
             -- gradual coverage of old pages into announcements.
@@ -422,6 +428,24 @@ class Database:
         db.execute('''INSERT OR IGNORE INTO cast_assets SELECT ?,image_url,cached_path,source_url,fetched_at
             FROM cast_assets WHERE event_id=?''', (target, old))
         db.execute('DELETE FROM cast_assets WHERE event_id=?', (old,))
+        cover = db.execute('SELECT * FROM event_covers WHERE event_id=?', (old,)).fetchone()
+        if cover:
+            existing = db.execute('SELECT * FROM event_covers WHERE event_id=?', (target,)).fetchone()
+            record = dict(existing or cover)
+            record['event_id'] = target
+            if existing:
+                if not record['thumbnail_url'] and cover['thumbnail_url']:
+                    for key in ('thumbnail_url', 'thumbnail_source_url', 'thumbnail_cms_id'):
+                        record[key] = cover[key]
+                if (bool(cover['cached_path']), cover['source_kind'] == 'cms_thumbnail', cover['verified_at'] or '') > (
+                        bool(existing['cached_path']), existing['source_kind'] == 'cms_thumbnail', existing['verified_at'] or ''):
+                    for key in ('image_url', 'source_url', 'source_kind', 'cached_path', 'content_hash',
+                                'verified_at', 'etag', 'last_modified', 'attempted_at', 'attempted_url', 'error'):
+                        record[key] = cover[key]
+            columns = list(record)
+            db.execute(f"INSERT OR REPLACE INTO event_covers ({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                       [record[c] for c in columns])
+            db.execute('DELETE FROM event_covers WHERE event_id=?', (old,))
         db.execute('''INSERT OR IGNORE INTO review_items(event_id,source_url,note,state,observed_at)
             SELECT ?,source_url,note,state,observed_at FROM review_items WHERE event_id=?''', (target, old))
         db.execute('DELETE FROM review_items WHERE event_id=?', (old,))
@@ -478,7 +502,37 @@ class Database:
             if is_new and discovered_after_baseline:
                 db.execute("""INSERT OR IGNORE INTO ticket_new_event_discoveries(event_id,discovered_at)
                     VALUES(?,?)""", (item["id"], stamp))
+            if 'thumbnail_url' in item:
+                db.execute('''INSERT INTO event_covers(event_id,thumbnail_url,thumbnail_source_url,thumbnail_cms_id)
+                    VALUES(?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET thumbnail_url=excluded.thumbnail_url,
+                    thumbnail_source_url=excluded.thumbnail_source_url,thumbnail_cms_id=excluded.thumbnail_cms_id''',
+                    (item['id'], item['thumbnail_url'], item.get('url'), item.get('thumbnail_cms_id')))
         return is_new
+
+    def event_cover(self, event_id: str) -> dict | None:
+        with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
+            row = db.execute('SELECT * FROM event_covers WHERE event_id=?', (event_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_event_cover(self, event_id: str, image_url: str, source_url: str, source_kind: str,
+                         cached_path: str, content_hash: str, etag: str | None = None, last_modified: str | None = None) -> None:
+        with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
+            db.execute('''INSERT INTO event_covers(event_id,image_url,source_url,source_kind,cached_path,content_hash,
+                verified_at,etag,last_modified,attempted_at,attempted_url,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)
+                ON CONFLICT(event_id) DO UPDATE SET image_url=excluded.image_url,source_url=excluded.source_url,
+                source_kind=excluded.source_kind,cached_path=excluded.cached_path,content_hash=excluded.content_hash,
+                verified_at=excluded.verified_at,etag=excluded.etag,last_modified=excluded.last_modified,
+                attempted_at=excluded.attempted_at,attempted_url=excluded.attempted_url,error=NULL''',
+                (event_id,image_url,source_url,source_kind,cached_path,content_hash,now(),etag,last_modified,now(),image_url))
+
+    def event_cover_error(self, event_id: str, attempted_url: str, error: str) -> None:
+        with self._connect() as db:
+            event_id = self._resolve_event_id(db, event_id)
+            db.execute('''INSERT INTO event_covers(event_id,attempted_at,attempted_url,error) VALUES(?,?,?,?)
+                ON CONFLICT(event_id) DO UPDATE SET attempted_at=excluded.attempted_at,
+                attempted_url=excluded.attempted_url,error=excluded.error''', (event_id,now(),attempted_url,error[:250]))
 
     def save_parsed(self, event_id: str, source_url: str, content_hash: str, parser: str,
                     tickets: Iterable[TicketRound], performances: Iterable[Performance],

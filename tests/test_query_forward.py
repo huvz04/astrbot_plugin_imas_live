@@ -130,7 +130,9 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
         self.plugin = self.module.ImasLivePlugin.__new__(self.module.ImasLivePlugin)
         self.plugin.config = {}
         self.plugin.service = Mock()
-        self.plugin.service.query_detail_texts = AsyncMock(return_value=['#7 a\nSP / normal', '#8 b'])
+        self.plugin.service.query_details = AsyncMock(return_value=[
+            {'event_id': 'a', 'text': '#7 a\nSP / normal', 'image_path': None},
+            {'event_id': 'b', 'text': '#8 b', 'image_path': None}])
         self.plugin.service.refresh_open_ticket_sources = AsyncMock(return_value={'refreshed': 0, 'failed': 0})
         self.entries = [{'event_id': 'a', 'public_number': 7, 'title': 'a LIVE', 'url': 'https://long.example/one'},
                         {'event_id': 'b', 'public_number': 8, 'title': 'b LIVE', 'url': 'https://long.example/two'}]
@@ -184,7 +186,7 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
     async def test_live_month_also_sends_once_after_image(self):
         await self.plugin.imaslive(self.event, '10')
         self.plugin.service.calendar_entries.assert_awaited_once_with(month=10)
-        self.plugin.service.query_detail_texts.assert_awaited_once_with(self.entries, 'live')
+        self.plugin.service.query_details.assert_awaited_once_with(self.entries, 'live')
         self.assertEqual(self.event.send.await_count, 2)
         self.assertEqual(self.event.send.await_args_list[0].args[0].chain[0][0], 'image')
         self.assertIsInstance(self.event.send.await_args.args[0].chain[0], NodesContract)
@@ -209,30 +211,30 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
             await self.plugin.imasticket(self.event)
             self.assertEqual(self.event.send.await_count, 2)
             self.assertIn('活动索引', self.event.send.await_args.args[0].chain[0].text)
-        self.plugin.service.query_detail_texts.assert_not_awaited()
+        self.plugin.service.query_details.assert_not_awaited()
 
     async def test_empty_result_only_emits_image_and_index_is_bounded(self):
         self.plugin.service.ticket_entries.return_value = ([], NOW, NOW, '')
         await self.plugin.imasticket(self.event)
         self.event.send.assert_awaited_once()
         self.assertEqual(self.event.send.await_args.args[0].chain[0][0], 'image')
-        self.plugin.service.query_detail_texts.assert_not_awaited()
+        self.plugin.service.query_details.assert_not_awaited()
         index = self.plugin._query_index([{'event_id': str(i), 'public_number': i, 'title': 'x'*100} for i in range(40)])
         self.assertLess(len(index), 800)
         self.assertIn('另有 28 个活动', index)
 
     async def test_forward_format_error_is_separate_from_image_and_render_error_never_forwards(self):
-        self.plugin.service.query_detail_texts.side_effect = ValueError('bad cache')
+        self.plugin.service.query_details.side_effect = ValueError('bad cache')
         await self.plugin.imasticket(self.event)
         self.assertEqual(self.event.send.await_count, 2)
         self.assertNotIn('图片生成失败', self.event.send.await_args.args[0].chain[0].text)
         self.event.send.reset_mock()
-        self.plugin.service.query_detail_texts.reset_mock()
+        self.plugin.service.query_details.reset_mock()
         self.plugin.renderer.render_ticket_overview.side_effect = ValueError('font')
         await self.plugin.imasticket(self.event)
         self.event.send.assert_awaited_once()
         self.assertIn('图片生成失败', self.event.send.await_args.args[0][1])
-        self.plugin.service.query_detail_texts.assert_not_awaited()
+        self.plugin.service.query_details.assert_not_awaited()
 
     async def test_failed_image_never_sends_or_formats_forward(self):
         for failure in [RuntimeError('image failed'), False]:
@@ -240,7 +242,7 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
             self.event.send.side_effect = [failure]
             await self.plugin.imasticket(self.event)
             self.event.send.assert_awaited_once()
-            self.plugin.service.query_detail_texts.assert_not_awaited()
+            self.plugin.service.query_details.assert_not_awaited()
 
     async def test_legacy_first_yield_reproduces_missing_forward(self):
         forward = AsyncMock()
@@ -301,3 +303,35 @@ class QueryForwardDelivery(unittest.IsolatedAsyncioTestCase):
             await stopped_pipeline(self.event, getattr(self.plugin, command), *args)
             self.event.send.assert_awaited_once()
             self.assertIn('用法', self.event.send.await_args.args[0][1])
+
+    async def test_native_cover_nodes_keep_each_event_image_text_pair_and_at_most_one_image(self):
+        self.plugin.service.query_details.return_value = [
+            {'event_id': 'b', 'text': '#8 b', 'image_path': str(self.image)},
+            {'event_id': 'a', 'text': '#7 a', 'image_path': None}]
+        await self.plugin.imasticket(self.event)
+        nodes = self.event.send.await_args.args[0].chain[0].nodes
+        self.assertEqual(nodes[0].content[0], ('image', str(self.image)))
+        self.assertEqual(nodes[0].content[1].text, '#8 b')
+        self.assertEqual([part.text for part in nodes[1].content], ['#7 a'])
+
+    async def test_failed_cover_forward_retries_text_forward_then_short_index_if_needed(self):
+        self.plugin.service.query_details.return_value[0]['image_path'] = str(self.image)
+        for failure in [RuntimeError('image not supported'), False]:
+            for retry_failed in [False, True]:
+                with self.subTest(failure=failure, retry_failed=retry_failed):
+                    self.event.send.reset_mock()
+                    self.event.send.side_effect = [None, failure, False if retry_failed else None, None]
+                    await self.plugin.imasticket(self.event)
+                    self.assertEqual(self.event.send.await_count, 4 if retry_failed else 3)
+                    original = self.event.send.await_args_list[1].args[0].chain[0].nodes
+                    retried = self.event.send.await_args_list[2].args[0].chain[0].nodes
+                    self.assertEqual(original[0].content[0][0], 'image')
+                    self.assertTrue(all(len(node.content) == 1 and hasattr(node.content[0], 'text') for node in retried))
+                    if retry_failed:
+                        self.assertIn('活动索引', self.event.send.await_args.args[0].chain[0].text)
+
+    async def test_missing_cover_does_not_skip_text_or_retry_text_only_forward(self):
+        self.plugin.service.query_details.return_value[0]['image_path'] = str(self.image.parent/'missing.png')
+        await self.plugin.imasticket(self.event)
+        self.assertEqual(self.event.send.await_count, 2)
+        self.assertTrue(all(len(n.content) == 1 for n in self.event.send.await_args.args[0].chain[0].nodes))

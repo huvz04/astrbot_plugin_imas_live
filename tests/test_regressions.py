@@ -164,7 +164,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             service.db.save_parsed('good', source, 'verified-v1', 'test', [], [
                 Performance('session', '2026-10-10', '开演 18:00 JST', 'Hall',
                             evidence=Evidence(source, 'official', 'test'))], [], [])
-            async def refresh(article):
+            async def refresh(article, cache_cover=False):
                 if article.cms_id == 'bad':
                     raise SourceUnavailable('专题未能解析')
                 return True

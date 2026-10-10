@@ -65,3 +65,4 @@ class ParsedPage:
     # Only actual roster images found inside an official CAST/出演者 section.
     cast_asset_urls: list[str] = field(default_factory=list)
     review_notes: list[str] = field(default_factory=list)
+    cover_url: str | None = None  # actual root-page og:image; never a body/cast img

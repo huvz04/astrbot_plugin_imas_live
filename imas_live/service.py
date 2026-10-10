@@ -26,6 +26,7 @@ from .cms import CmsArticle, OfficialCmsClient, SourceUnavailable, event_root
 from .database import Database
 from .parsing import parse_shiny_information, parse_day_cast, official_roster_image_urls, parse_ticket_page, parse_ticket_news, parse_venue, parse_information, schedule_performances, clean
 from .models import ParsedPage
+from .covers import cms_thumbnail_url, og_cover_url, download_cover, store_cover, local_cover, MAX_COVER_BYTES, FORWARD_BUDGET
 
 
 BRAND_COMMANDS = {
@@ -165,7 +166,7 @@ class ImasLiveService:
                 if not self._fetchable_special_page(article.url):
                     continue
                 try:
-                    changed += int(await self._refresh_article(article))
+                    changed += int(await self._refresh_article(article, cache_cover=True))
                 except SourceUnavailable as exc:
                     failed += 1
                     logger.warning("IM@S source unavailable: event=%s source=%s reason=%s", article.cms_id, article.url, exc)
@@ -280,9 +281,22 @@ class ImasLiveService:
             self.db.set_meta('last_news_error', str(exc))
             logger.warning('IM@S news discovery unavailable: %s', exc)
 
-    async def _refresh_article(self, article: CmsArticle) -> bool:
+    async def _refresh_article(self, article: CmsArticle, cache_cover: bool = False) -> bool:
         """Refresh one already-known official event without broad directory work."""
         parsed = await self._collect_special(article)
+        if cache_cover:
+            try:
+                scope = [vars_for_slots(p) for p in parsed.performances]
+                if not scope:
+                    known = await asyncio.to_thread(self.db.detail, article.cms_id)
+                    scope = (known or {}).get('performances', [])
+                zone = ZoneInfo(str(self.config.get('display_timezone', 'Asia/Shanghai')))
+                if self._ticket_event_window(scope, datetime.now(zone), zone)[0]:
+                    await self._cache_event_cover(article, parsed.cover_url)
+            except Exception:
+                # The explicit cover is independent of ticket parsing; neither
+                # image nor cache failures may affect verified business facts.
+                logger.warning('IM@S event cover failed: event=%s', article.cms_id, exc_info=True)
         if not (parsed.ticket_rounds or parsed.performances):
             raise SourceUnavailable('专题未能解析，保留已知记录并暂停该来源提醒')
         digest = hashlib.sha256(json.dumps({
@@ -295,6 +309,76 @@ class ImasLiveService:
         if assets:
             await asyncio.to_thread(self.db.save_cast_assets, article.cms_id, article.url, assets)
         return changed
+
+    async def _cache_event_cover(self, article: CmsArticle, og_url: str | None) -> None:
+        event_id = await asyncio.to_thread(self.db.resolve_event_id, article.cms_id)
+        row = await asyncio.to_thread(self.db.event_cover, event_id)
+        if not row and not og_url:
+            return  # no known CMS thumbnail field or observed root og evidence
+        row = row or {}
+        preferred = row.get('thumbnail_url')
+        local = await asyncio.to_thread(local_cover, row, self.data_dir/'event-covers')
+        current = datetime.now(timezone.utc)
+        verified = self._ticket_moment(row.get('verified_at'))
+        expected = preferred or og_url or row.get('image_url')
+        if local and row.get('image_url') == expected and verified and current-verified < timedelta(hours=24):
+            return
+        attempted = self._ticket_moment(row.get('attempted_at'))
+        if row.get('error') and attempted and current-attempted < timedelta(minutes=30) and row.get('attempted_url') == (preferred or og_url or ''):
+            return
+        candidates = [(preferred, row.get('thumbnail_source_url') or article.url, 'cms_thumbnail')] if preferred else []
+        # Dynamic Article/get contains body HTML, not SSR <head>. Only an
+        # explicitly known CMS record may need this bounded background fallback.
+        async def fallback_url():
+            if og_url:
+                return og_url
+            if article.url and '/live_events/' in article.url:
+                shell = await asyncio.wait_for(self.client.fetch_html(article.url), timeout=15)
+                return og_cover_url(shell, article.url)
+            return None
+        if not candidates:
+            try:
+                fallback = await fallback_url()
+                if fallback:
+                    candidates.append((fallback, article.url, 'og_image'))
+            except Exception as exc:
+                await asyncio.to_thread(self.db.event_cover_error, event_id, '', type(exc).__name__)
+                return
+        last_error = 'no explicit event cover'
+        for index in range(2):
+            if index >= len(candidates):
+                break
+            url, source_url, kind = candidates[index]
+            try:
+                if local and row.get('image_url') == url and verified and current-verified < timedelta(hours=24):
+                    return
+                headers = {}
+                if local and row.get('image_url') == url:
+                    if row.get('etag'):
+                        headers['If-None-Match'] = row['etag']
+                    if row.get('last_modified'):
+                        headers['If-Modified-Since'] = row['last_modified']
+                content, response_headers = await download_cover(self.client, url, headers)
+                if content is None:
+                    if not local or row.get('image_url') != url:
+                        raise ValueError('304 without verified local cover')
+                    path, digest = local[0], row['content_hash']
+                else:
+                    path, digest = await asyncio.to_thread(store_cover, self.data_dir/'event-covers', event_id, content)
+                await asyncio.to_thread(self.db.save_event_cover, event_id, url, source_url, kind, path, digest,
+                    response_headers.get('etag', row.get('etag') if content is None else None),
+                    response_headers.get('last-modified', row.get('last_modified') if content is None else None))
+                return
+            except Exception as exc:
+                last_error = type(exc).__name__
+                if index == 0 and preferred:
+                    try:
+                        fallback = await fallback_url()
+                        if fallback and fallback != preferred:
+                            candidates.append((fallback, article.url, 'og_image'))
+                    except Exception:
+                        pass
+        await asyncio.to_thread(self.db.event_cover_error, event_id, preferred or og_url or '', last_error)
 
     async def refresh_open_ticket_sources(self, current: datetime | None = None) -> dict[str, int]:
         """Fair bounded recheck, including future LIVE events whose old round ended."""
@@ -417,6 +501,8 @@ class ImasLiveService:
             visited.add(url)
             html = await self.client.event_html(url)
             soup = BeautifulSoup(html, 'html.parser')
+            if url == article.url:
+                result.cover_url = og_cover_url(html, article.url)
             # The Shirube home links several cities. Bind the city before following ticket redirects.
             if 'gkmas_livetour_shirube' in root and selected_stop is None:
                 for a in soup.select('a[href]'):
@@ -531,8 +617,12 @@ class ImasLiveService:
 
     @staticmethod
     def _event_record(article: CmsArticle) -> dict[str, Any]:
-        return {"id": article.cms_id, "title": article.title, "brands": article.brands, "url": article.url,
+        record = {"id": article.cms_id, "title": article.title, "brands": article.brands, "url": article.url,
                 "event_display": article.event_display, "venue": article.venue, "updated": article.updated}
+        if 'thumbnail' in article.raw:
+            record.update(thumbnail_url=cms_thumbnail_url(article.raw['thumbnail']),
+                          thumbnail_cms_id=str(article.raw.get('_id') or article.cms_id))
+        return record
 
     @staticmethod
     def _fetchable_special_page(url: str | None) -> bool:
@@ -737,12 +827,16 @@ class ImasLiveService:
         return [item for group in ordered for item in group], start, end, self._status(current, zone)
 
     async def query_detail_texts(self, entries: list[dict[str, Any]], kind: str) -> list[str]:
+        """Compatibility text-only interface, with no image/network work."""
+        return [row['text'] for row in await self.query_details(entries, kind, include_covers=False)]
+
+    async def query_details(self, entries: list[dict[str, Any]], kind: str, include_covers: bool = True) -> list[dict[str, Any]]:
         """One cached detail per displayed event; never fetch or expand a LIVE window."""
         groups: dict[str, list[dict[str, Any]]] = {}
         for entry in entries:
             groups.setdefault(entry['event_id'], []).append(entry)
         zone = ZoneInfo('Asia/Shanghai')
-        texts = []
+        details = []
         for event_id, group in groups.items():
             detail = await asyncio.to_thread(self.db.detail, event_id)
             event = detail['event'] if detail else {}
@@ -794,8 +888,17 @@ class ImasLiveService:
                             lines.append('官方出演图：'+asset['image_url'])
                             asset_urls.add(asset['image_url'])
             lines.append('\n官方活动页：'+str(event.get('official_url') or first.get('url') or '未收录'))
-            texts.append('\n'.join(lines))
-        return texts
+            details.append({'event_id': event_id, 'text': '\n'.join(lines), 'image_path': None})
+        if include_covers:
+            # Reserve conservative JSON/text overhead before base64 images.
+            budget = max(0, FORWARD_BUDGET - sum(6*len(row['text'].encode('utf-8'))+2048 for row in details))
+            for row in details:
+                cover = await asyncio.to_thread(self.db.event_cover, row['event_id'])
+                found = await asyncio.to_thread(local_cover, cover, self.data_dir/'event-covers', min(MAX_COVER_BYTES, budget*3//4))
+                if found:
+                    row['image_path'] = found[0]
+                    budget = max(0, budget - ((found[1]+2)//3)*4 - 1024)
+        return details
 
     def _ticket_event_window(self, performances: list[dict[str, Any]], current: datetime,
                              zone: ZoneInfo) -> tuple[bool, datetime]:

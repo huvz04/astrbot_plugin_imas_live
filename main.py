@@ -221,14 +221,36 @@ class ImasLivePlugin(Star):
             if not self_id.isdigit() or int(self_id) == 0:
                 logger.warning('IM@S query forward: kind=%s platform=%s nodes=0 result=missing_bot_identity', kind, platform)
                 return self._query_index(entries)
-            texts = await self.service.query_detail_texts(entries, kind)
-            nodes = [Node(uin=self_id, name='IM@S LIVE', content=[Plain(text)]) for text in texts]
+            details = await self.service.query_details(entries, kind)
+            nodes, image_count = [], 0
+            for detail in details:
+                content = []
+                if detail.get('image_path'):
+                    try:
+                        if Path(detail['image_path']).is_file():
+                            content.append(Image.fromFileSystem(detail['image_path']))
+                            image_count += 1
+                    except Exception:
+                        logger.warning('IM@S cached cover component failed: event=%s', detail['event_id'], exc_info=True)
+                content.append(Plain(detail['text']))
+                nodes.append(Node(uin=self_id, name='IM@S LIVE', content=content))
             node_count = len(nodes)
             if nodes:
-                sent = await event.send(MessageChain([Nodes(nodes=nodes)]))
-                if sent is False:
-                    raise RuntimeError('adapter reported a failed forward send')
-                logger.info('IM@S query forward: kind=%s platform=%s nodes=%s result=send_completed', kind, platform, node_count)
+                try:
+                    sent = await event.send(MessageChain([Nodes(nodes=nodes)]))
+                    if sent is False:
+                        raise RuntimeError('adapter reported a failed forward send')
+                except Exception:
+                    if not image_count:
+                        raise
+                    logger.warning('IM@S query forward: kind=%s platform=%s nodes=%s images=%s result=retry_text_only',
+                                   kind, platform, node_count, image_count, exc_info=True)
+                    text_nodes = [Node(uin=self_id, name='IM@S LIVE', content=[Plain(row['text'])]) for row in details]
+                    sent = await event.send(MessageChain([Nodes(nodes=text_nodes)]))
+                    if sent is False:
+                        raise RuntimeError('adapter reported a failed text-only forward send')
+                    image_count = 0
+                logger.info('IM@S query forward: kind=%s platform=%s nodes=%s images=%s result=send_completed', kind, platform, node_count, image_count)
             return None
         except Exception:
             logger.exception('IM@S query forward: kind=%s platform=%s nodes=%s result=failed', kind, platform, node_count)
