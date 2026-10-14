@@ -922,6 +922,17 @@ class Database:
                     THEN excluded.updated_at ELSE {table}.updated_at END""",
                        (umo, int(enabled), stamp, stamp))
 
+    def migrate_ticket_new_channel(self) -> set[str]:
+        """Baseline existing announcements once when moving to ticket groups."""
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT value FROM meta WHERE key='ticket_new_ticket_channel_v1'").fetchone()
+            if row:
+                return set(json.loads(row['value']))
+            identities = [row['round_id'] for row in db.execute('SELECT round_id FROM ticket_new_rounds')]
+            db.execute("INSERT INTO meta VALUES('ticket_new_ticket_channel_v1',?)", (json.dumps(identities),))
+        return set(identities)
+
     def subscription_enabled(self, kind: str, umo: str) -> bool:
         table = self._subscription_table(kind)
         with self._connect() as db:
@@ -938,7 +949,7 @@ class Database:
             deliveries = [dict(row) for row in db.execute('''SELECT state,payload,updated_at FROM delivery_log
                 WHERE subscription_id=? AND notification_type='ticket_new'
                 ORDER BY updated_at DESC,dedupe_key DESC LIMIT 3''', (umo,))]
-            latest = db.execute('''SELECT e.title,q.observed_at FROM ticket_new_rounds q JOIN events e ON e.id=q.event_id
+            latest = db.execute('''SELECT e.title,q.observed_at,q.round_id FROM ticket_new_rounds q JOIN events e ON e.id=q.event_id
                 ORDER BY q.observed_at DESC,q.round_id DESC LIMIT 1''').fetchone()
         return {'subscriptions': subscriptions, 'deliveries': deliveries, 'latest_discovery': dict(latest) if latest else None}
 

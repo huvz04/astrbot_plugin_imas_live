@@ -357,7 +357,7 @@ class ImasLivePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imaslive enable")
     async def imaslive_enable(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """管理员：开启本群 LIVE 开演提醒与新增现场抽选公告。"""
+        """管理员：开启本群 LIVE 开演提醒。"""
         event.stop_event()
         if extra_argument:
             await event.send(event.plain_result("用法：/imaslive enable"))
@@ -367,12 +367,12 @@ class ImasLivePlugin(Star):
             await event.send(event.plain_result("LIVE 订阅只能在群内设置。"))
             return
         self.service.set_subscription("live", umo, True)
-        await event.send(event.plain_result("已开启本群 LIVE 开演提醒与新增现场抽选公告。"))
+        await event.send(event.plain_result("已开启本群 LIVE 开演提醒。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imaslive disable")
     async def imaslive_disable(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """管理员：关闭本群 LIVE 开演提醒与新增现场抽选公告。"""
+        """管理员：关闭本群 LIVE 开演提醒。"""
         event.stop_event()
         if extra_argument:
             await event.send(event.plain_result("用法：/imaslive disable"))
@@ -382,16 +382,16 @@ class ImasLivePlugin(Star):
             await event.send(event.plain_result("LIVE 订阅只能在群内设置。"))
             return
         self.service.set_subscription("live", umo, False)
-        await event.send(event.plain_result("已关闭本群 LIVE 开演提醒与新增现场抽选公告。"))
+        await event.send(event.plain_result("已关闭本群 LIVE 开演提醒。"))
 
     @filter.command("imasticket")
     async def imasticket(self, event: AstrMessageEvent, action: str = "", extra_argument: str = ""):
         """按 LIVE 开始时间显示演出前已收录的现场抽选、转售及各轮状态。"""
-        if action.casefold() in {"get", "enable", "disable"}:
+        if action.casefold() in {"get", "enable", "disable", "status"}:
             return
         event.stop_event()
         if action or extra_argument:
-            await event.send(event.plain_result("用法：/imasticket、/imasticket get <活动编号>、/imasticket enable|disable"))
+            await event.send(event.plain_result("用法：/imasticket、/imasticket get <活动编号>、/imasticket enable|disable、/imasticket status"))
             return
         try:
             async for response in self._wait_for_first_directory(event):
@@ -433,34 +433,44 @@ class ImasLivePlugin(Star):
             await event.send(event.plain_result("抽票图片生成失败；请检查插件字体配置和日志。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("imasticket status")
+    async def imasticket_status(self, event: AstrMessageEvent, extra_argument: str = ""):
+        """管理员：只读查看本群票务通知状态。"""
+        if extra_argument:
+            event.stop_event()
+            await event.send(event.plain_result('用法：/imasticket status'))
+            return
+        await self.imaslive_status(event)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasticket enable")
     async def imasticket_enable(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """管理员：开启本群抽票截止提醒。"""
+        """管理员：开启本群新增抽选公告与抽票截止提醒。"""
         event.stop_event()
         if extra_argument:
             await event.send(event.plain_result("用法：/imasticket enable"))
             return
         umo = self._group_umo(event)
         if not umo:
-            await event.send(event.plain_result("抽票截止提醒只能在群内设置。"))
+            await event.send(event.plain_result("票务订阅只能在群内设置。"))
             return
         self.service.set_subscription("ticket", umo, True)
-        await event.send(event.plain_result("已开启本群抽票截止提醒（截止前 24 小时和 1 小时各一次）。"))
+        await event.send(event.plain_result("已开启本群新增现场抽选公告与抽票截止提醒（截止前 24 小时和 1 小时各一次）。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasticket disable")
     async def imasticket_disable(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """管理员：关闭本群抽票截止提醒。"""
+        """管理员：关闭本群新增抽选公告与抽票截止提醒。"""
         event.stop_event()
         if extra_argument:
             await event.send(event.plain_result("用法：/imasticket disable"))
             return
         umo = self._group_umo(event)
         if not umo:
-            await event.send(event.plain_result("抽票截止提醒只能在群内设置。"))
+            await event.send(event.plain_result("票务订阅只能在群内设置。"))
             return
         self.service.set_subscription("ticket", umo, False)
-        await event.send(event.plain_result("已关闭本群抽票截止提醒。"))
+        await event.send(event.plain_result("已关闭本群新增现场抽选公告与抽票截止提醒。"))
 
     async def terminate(self):
         for task in (self._sync_task, self._reminder_task):

@@ -73,6 +73,7 @@ class ImasLiveService:
         # The old whitelist described ticket reminders only.  It is intentionally
         # never copied to the newly introduced LIVE reminder table.
         self.db.migrate_legacy_ticket_subscriptions(self.config.get("white_umos", []))
+        self._ticket_new_channel_baseline = self.db.migrate_ticket_new_channel()
         self.client = OfficialCmsClient(float(self.config.get("request_timeout_seconds", 25)))
         self._sync_lock = asyncio.Lock()
         self.directory_ready = asyncio.Event()
@@ -107,18 +108,23 @@ class ImasLiveService:
         lines = ['IM@S 本群通知状态', '会话：'+umo,
             '后台通知总开关：'+('开启' if enabled else '关闭'),
             '本群 LIVE 订阅：'+('开启' if live.get('enabled') else '关闭／未订阅'),
-            '新增抽选通知：'+('开启' if announcements and live.get('enabled') else '关闭'),
-            '本群抽票截止订阅：'+('开启' if ticket.get('enabled') else '关闭／未订阅')]
+            '本群票务订阅：'+('开启' if ticket.get('enabled') else '关闭／未订阅'),
+            '新增抽选通知：'+('开启' if announcements and ticket.get('enabled') else '关闭')]
         if not announcements:
             lines.append('新增抽选被 WebUI 总开关或新增公告开关关闭。')
         if live.get('enabled'):
             lines.append('本次 LIVE 启用：'+stamp(live.get('updated_at'))+' 北京时间')
+        if ticket.get('enabled'):
+            lines.append('本次票务启用：'+stamp(ticket.get('updated_at'))+' 北京时间')
         latest = snapshot['latest_discovery']
         if latest:
             lines.append('最近发现：'+latest['title'][:80]+'｜'+stamp(latest['observed_at']))
-            observed, since = self._ticket_moment(latest['observed_at']), self._ticket_moment(live.get('updated_at'))
-            if live.get('enabled') and observed and since and observed < since:
-                lines.append('最近这条在本群开启前发现，按规则不补发。')
+            observed, since = self._ticket_moment(latest['observed_at']), self._ticket_moment(ticket.get('updated_at'))
+            identities = await asyncio.to_thread(self.db.ticket_identity_ids, latest['round_id'])
+            if ticket.get('enabled') and self._ticket_new_channel_baseline.intersection(identities):
+                lines.append('最近这条在通知切换到票务订阅前已存在，不补发历史公告。')
+            elif ticket.get('enabled') and observed and since and observed < since:
+                lines.append('最近这条在本群票务开启前发现，按规则不补发。')
         states = {'sent': '已发送', 'failed': '发送失败', 'inflight': '发送处理中'}
         if snapshot['deliveries']:
             lines.append('本群最近新增抽选投递：')
@@ -127,7 +133,7 @@ class ImasLiveService:
         else:
             lines.append('本群暂无新增抽选投递记录。')
         lines.append('群订阅保存在插件数据库；WebUI 白名单为空不会清除。')
-        lines.append('新增抽选用 /imaslive enable|disable；截止提醒用 /imasticket enable|disable。')
+        lines.append('开演提醒用 /imaslive enable|disable；新增抽选与截止提醒用 /imasticket enable|disable。')
         return '\n'.join(lines)
 
     async def sync(self, full_directory: bool = True) -> dict[str, Any]:
@@ -1158,7 +1164,7 @@ class ImasLiveService:
             await asyncio.to_thread(self.db.finish_delivery, row["delivery_key"], success)
 
     async def claim_new_ticket_announcements(self, current: datetime | None = None) -> list[dict[str, Any]]:
-        """Claim newly verified onsite lottery rounds for LIVE-subscribed groups.
+        """Claim newly verified onsite lottery rounds for ticket-subscribed groups.
 
         Candidate rows are written atomically with a successful special-page
         parse.  The source baseline rules live in the database, while this
@@ -1170,7 +1176,7 @@ class ImasLiveService:
         current = (current or datetime.now(zone)).astimezone(zone)
         rows = await asyncio.to_thread(self.db.new_ticket_round_rows)
         with self.db._connect() as db:
-            umos = [str(x["umo"]) for x in db.execute("SELECT umo FROM live_group_subscriptions WHERE enabled=1")]
+            umos = [str(x["umo"]) for x in db.execute("SELECT umo FROM ticket_group_subscriptions WHERE enabled=1")]
         selected: list[dict[str, Any]] = []
         for row in rows:
             if not self._brand_allowed(row["brands_json"]) or not self._source_is_fresh(row, current):
@@ -1208,13 +1214,15 @@ class ImasLiveService:
                 times.append("截止时间待核验")
             subtitle = f"{row['name']}｜{status}\n" + "\n".join(times)
             url = row.get("url") or row.get("source_url") or ""
+            identity_ids = await asyncio.to_thread(self.db.ticket_identity_ids, row['round_id'])
+            if self._ticket_new_channel_baseline.intersection(identity_ids):
+                continue
             for umo in umos:
-                enabled_since = await asyncio.to_thread(self.db.subscription_updated_at, "live", umo)
+                enabled_since = await asyncio.to_thread(self.db.subscription_updated_at, "ticket", umo)
                 # A group enabled after discovery deliberately does not receive
                 # accumulated announcements, including after disable/re-enable.
                 if enabled_since and observed < enabled_since:
                     continue
-                identity_ids = await asyncio.to_thread(self.db.ticket_identity_ids, row['round_id'])
                 keys = [f"ticket_new|{umo}|{identity}" for identity in identity_ids]
                 key = keys[0]
                 payload = f"#{row.get('public_number') or '?'} {row['title']}｜{row['name']}｜{status}"

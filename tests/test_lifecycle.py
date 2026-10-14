@@ -262,9 +262,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(commands), len(entries), "AstrBot must not receive duplicate command names")
         self.assertEqual(set(commands), {
             "imaslive", "imaslive next", "imaslive enable", "imaslive disable", "imaslive status",
-            "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
+            "imasticket", "imasticket get", "imasticket enable", "imasticket disable", "imasticket status",
         })
-        for name in ("imaslive enable", "imaslive disable", "imaslive status", "imasticket enable", "imasticket disable"):
+        for name in ("imaslive enable", "imaslive disable", "imaslive status", "imasticket enable", "imasticket disable", "imasticket status"):
             self.assertEqual(commands[name].permissions, ["admin"])
         self.assertEqual(commands["imaslive next"].permissions, [])
         self.assertEqual(commands["imasticket get"].permissions, [])
@@ -314,6 +314,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin.service.notification_status.assert_awaited_once_with('test:GroupMessage:42')
         event.send.assert_awaited_once_with(('text', '本群通知状态'))
         plugin.service.set_subscription.assert_not_called()
+        plugin.service.notification_status.reset_mock()
+        await module._test_filter.dispatch(plugin, 'imasticket status', event, is_admin=True)
+        plugin.service.notification_status.assert_awaited_once_with('test:GroupMessage:42')
         for command, origin in [('imaslive status extra', 'test:GroupMessage:42'), ('imaslive status', 'test:FriendMessage:42')]:
             plugin.service.notification_status.reset_mock()
             event.unified_msg_origin = origin
