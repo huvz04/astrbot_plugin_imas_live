@@ -293,14 +293,14 @@ class ImasLivePlugin(Star):
         """显示未来30天或指定完整自然月的演出长图。"""
         # Native children own these verbs.  This public query handler never
         # writes subscriptions, including if a child is disabled or renamed.
-        if month_argument.casefold() in {"next", "enable", "disable"}:
+        if month_argument.casefold() in {"next", "enable", "disable", "status"}:
             return
         event.stop_event()
         try:
             try:
                 month = parse_live_month(" ".join(part for part in (month_argument, extra_argument) if part))
             except ValueError:
-                await event.send(event.plain_result('用法：/imaslive、/imaslive 1—12、/imaslive next [企划]、/imaslive enable|disable'))
+                await event.send(event.plain_result('用法：/imaslive、/imaslive 1—12、/imaslive next [企划]、/imaslive enable|disable、/imaslive status'))
                 return
             async for response in self._wait_for_first_directory(event):
                 await event.send(response)
@@ -338,6 +338,21 @@ class ImasLivePlugin(Star):
         except Exception:
             logger.exception("IM@S next live image rendering failed")
             await event.send(event.plain_result("日历图片生成失败；请检查插件字体配置和日志。"))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("imaslive status")
+    async def imaslive_status(self, event: AstrMessageEvent, extra_argument: str = ""):
+        """管理员：只读查看本群两路订阅与新增抽选投递记录。"""
+        event.stop_event()
+        if extra_argument:
+            await event.send(event.plain_result('用法：/imaslive status'))
+            return
+        umo = self._group_umo(event)
+        if not umo:
+            await event.send(event.plain_result('通知状态请在群内查询。'))
+            return
+        text = await self.service.notification_status(umo)
+        await event.send(event.plain_result(text))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imaslive enable")

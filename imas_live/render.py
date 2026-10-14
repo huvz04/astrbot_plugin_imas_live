@@ -119,7 +119,9 @@ class CalendarRenderer:
         fill, outline, badge_color = fills.get(ticket_status, ("#fff3f3" if deadline else "white", "#e4b4be" if deadline else "#e3e8f1", "#b93863"))
         subtitle = entry["subtitle"]
         if reminder:
-            subtitle += f"\n剩余约 {entry['remaining_minutes']} 分钟"
+            minutes = max(0, int(entry['remaining_minutes']))
+            duration = f"{(minutes + 3) // 6 / 10:g} 小时" if minutes >= 60 else f"{minutes} 分钟"
+            subtitle += f"\n剩余约 {duration}"
         sub = self._wrap(draw, subtitle, self.font(22), width)
         return {"color": color, "labels": labels, "title": title, "sub": sub, "deadline": deadline,
                 "ticket": ticket, "fill": fill, "outline": outline, "badge_color": badge_color,

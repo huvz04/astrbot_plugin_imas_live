@@ -93,6 +93,43 @@ class ImasLiveService:
     def set_subscription(self, kind: str, umo: str, value: bool) -> None:
         self.db.set_subscription(kind, umo, value)
 
+    async def notification_status(self, umo: str) -> str:
+        snapshot = await asyncio.to_thread(self.db.notification_status, umo)
+        live, ticket = (snapshot['subscriptions'][kind] or {} for kind in ('live', 'ticket'))
+        enabled = bool(self.config.get('enabled', True))
+        announcements = enabled and bool(self.config.get('ticket_new_announcement_enabled', True))
+        zone = ZoneInfo('Asia/Shanghai')
+
+        def stamp(value):
+            moment = self._ticket_moment(value)
+            return moment.astimezone(zone).strftime('%Y.%m.%d %H:%M:%S') if moment else '未记录'
+
+        lines = ['IM@S 本群通知状态', '会话：'+umo,
+            '后台通知总开关：'+('开启' if enabled else '关闭'),
+            '本群 LIVE 订阅：'+('开启' if live.get('enabled') else '关闭／未订阅'),
+            '新增抽选通知：'+('开启' if announcements and live.get('enabled') else '关闭'),
+            '本群抽票截止订阅：'+('开启' if ticket.get('enabled') else '关闭／未订阅')]
+        if not announcements:
+            lines.append('新增抽选被 WebUI 总开关或新增公告开关关闭。')
+        if live.get('enabled'):
+            lines.append('本次 LIVE 启用：'+stamp(live.get('updated_at'))+' 北京时间')
+        latest = snapshot['latest_discovery']
+        if latest:
+            lines.append('最近发现：'+latest['title'][:80]+'｜'+stamp(latest['observed_at']))
+            observed, since = self._ticket_moment(latest['observed_at']), self._ticket_moment(live.get('updated_at'))
+            if live.get('enabled') and observed and since and observed < since:
+                lines.append('最近这条在本群开启前发现，按规则不补发。')
+        states = {'sent': '已发送', 'failed': '发送失败', 'inflight': '发送处理中'}
+        if snapshot['deliveries']:
+            lines.append('本群最近新增抽选投递：')
+            lines.extend(stamp(row['updated_at'])+'｜'+states.get(row['state'], row['state'])+'｜'+row['payload'][:100]
+                         for row in snapshot['deliveries'])
+        else:
+            lines.append('本群暂无新增抽选投递记录。')
+        lines.append('群订阅保存在插件数据库；WebUI 白名单为空不会清除。')
+        lines.append('新增抽选用 /imaslive enable|disable；截止提醒用 /imasticket enable|disable。')
+        return '\n'.join(lines)
+
     async def sync(self, full_directory: bool = True) -> dict[str, Any]:
         """Fetch only verified CMS and direct public special pages. Never deletes old data."""
         if self._sync_lock.locked():

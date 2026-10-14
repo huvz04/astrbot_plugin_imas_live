@@ -227,6 +227,15 @@ class CalendarTests(unittest.TestCase):
             self.assertIn("16:30", due[0]["subtitle"])
             asyncio.run(service.close())
 
+    def test_reminder_countdown_uses_hours_above_one_hour(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            renderer = CalendarRenderer(Path(tmp))
+            for minutes, duration in [(0, '0 分钟'), (59, '59 分钟'), (60, '1 小时'),
+                                      (61, '1 小时'), (90, '1.5 小时'), (1437, '24 小时'), (1440, '24 小时')]:
+                card = renderer._card_layout({'title': '提醒', 'subtitle': '截止提醒', 'brands': ['GAKUEN'],
+                                              'remaining_minutes': minutes}, reminder=True)
+                self.assertIn('剩余约 '+duration, '\n'.join(card['sub']))
+
     def test_renderer_exports_readable_empty_long_and_reminder_pngs(self):
         with tempfile.TemporaryDirectory() as tmp:
             renderer = CalendarRenderer(Path(tmp))

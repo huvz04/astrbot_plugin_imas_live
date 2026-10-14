@@ -928,6 +928,20 @@ class Database:
             row = db.execute(f"SELECT enabled FROM {table} WHERE umo=?", (umo,)).fetchone()
         return bool(row and row["enabled"])
 
+    def notification_status(self, umo: str) -> dict[str, Any]:
+        """Read only this exact platform/group's persisted notification state."""
+        with self._connect() as db:
+            subscriptions = {}
+            for kind in ('live', 'ticket'):
+                row = db.execute(f'SELECT enabled,created_at,updated_at FROM {self._subscription_table(kind)} WHERE umo=?', (umo,)).fetchone()
+                subscriptions[kind] = dict(row) if row else None
+            deliveries = [dict(row) for row in db.execute('''SELECT state,payload,updated_at FROM delivery_log
+                WHERE subscription_id=? AND notification_type='ticket_new'
+                ORDER BY updated_at DESC,dedupe_key DESC LIMIT 3''', (umo,))]
+            latest = db.execute('''SELECT e.title,q.observed_at FROM ticket_new_rounds q JOIN events e ON e.id=q.event_id
+                ORDER BY q.observed_at DESC,q.round_id DESC LIMIT 1''').fetchone()
+        return {'subscriptions': subscriptions, 'deliveries': deliveries, 'latest_discovery': dict(latest) if latest else None}
+
     def subscription_created_at(self, kind: str, umo: str) -> datetime | None:
         table = self._subscription_table(kind)
         with self._connect() as db:

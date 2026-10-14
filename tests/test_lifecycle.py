@@ -261,10 +261,10 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         commands = {entry.full_name: entry for entry in entries}
         self.assertEqual(len(commands), len(entries), "AstrBot must not receive duplicate command names")
         self.assertEqual(set(commands), {
-            "imaslive", "imaslive next", "imaslive enable", "imaslive disable",
+            "imaslive", "imaslive next", "imaslive enable", "imaslive disable", "imaslive status",
             "imasticket", "imasticket get", "imasticket enable", "imasticket disable",
         })
-        for name in ("imaslive enable", "imaslive disable", "imasticket enable", "imasticket disable"):
+        for name in ("imaslive enable", "imaslive disable", "imaslive status", "imasticket enable", "imasticket disable"):
             self.assertEqual(commands[name].permissions, ["admin"])
         self.assertEqual(commands["imaslive next"].permissions, [])
         self.assertEqual(commands["imasticket get"].permissions, [])
@@ -298,6 +298,27 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin.service.set_subscription.assert_not_called()
         await module._test_filter.dispatch(plugin, "imaslive start", event, is_admin=True)
         plugin.service.set_subscription.assert_called_once_with("live", "test:GroupMessage:42", True)
+
+    async def test_group_status_is_admin_only_read_only_and_directly_sent(self):
+        module = plugin_module()
+        plugin = module.ImasLivePlugin.__new__(module.ImasLivePlugin)
+        plugin.service = Mock()
+        plugin.service.notification_status = AsyncMock(return_value='本群通知状态')
+        event = Mock()
+        event.unified_msg_origin = 'test:GroupMessage:42'
+        event.plain_result.side_effect = lambda text: ('text', text)
+        event.send = AsyncMock()
+        self.assertEqual(await module._test_filter.dispatch(plugin, 'imaslive status', event, is_admin=False), 'permission_denied')
+        plugin.service.notification_status.assert_not_awaited()
+        await module._test_filter.dispatch(plugin, 'imaslive status', event, is_admin=True)
+        plugin.service.notification_status.assert_awaited_once_with('test:GroupMessage:42')
+        event.send.assert_awaited_once_with(('text', '本群通知状态'))
+        plugin.service.set_subscription.assert_not_called()
+        for command, origin in [('imaslive status extra', 'test:GroupMessage:42'), ('imaslive status', 'test:FriendMessage:42')]:
+            plugin.service.notification_status.reset_mock()
+            event.unified_msg_origin = origin
+            await module._test_filter.dispatch(plugin, command, event, is_admin=True)
+            plugin.service.notification_status.assert_not_awaited()
 
     async def test_reload_starts_once_and_first_query_waits_for_directory(self):
         with tempfile.TemporaryDirectory() as directory:

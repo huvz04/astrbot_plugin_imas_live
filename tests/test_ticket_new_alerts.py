@@ -136,3 +136,46 @@ class TicketNewAlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(due), 1)
         self.assertEqual(due[0]["ticket_status"], "upcoming")
         self.assertIn("尚未开始", due[0]["subtitle"])
+
+    async def test_two_groups_delivery_results_and_empty_config_persistence_are_independent(self):
+        first, second = 'test:GroupMessage:first', 'test:GroupMessage:second'
+        for umo in (first, second):
+            self.make_live_subscription_old(umo)
+        self.add_event('two-groups')
+        self.service.db.save_parsed('two-groups', self.source, 'v1', 'test', [self.ticket('one')], [], [], [])
+        self.service.db.save_parsed('two-groups', self.source, 'v2', 'test', [self.ticket('one'), self.ticket('two')], [], [], [])
+        due = await self.service.claim_new_ticket_announcements(self.now)
+        self.assertEqual({r['umo'] for r in due}, {first, second})
+        await self.service.finish_reminders([r for r in due if r['umo'] == first], True)
+        await self.service.finish_reminders([r for r in due if r['umo'] == second], False)
+        await self.service.close()
+        self.service = ImasLiveService(Path(self.temp.name), {})
+        for umo in (first, second):
+            self.assertTrue(self.service.subscription_enabled('live', umo))
+            before = self.service.db.notification_status(umo)
+            text = await self.service.notification_status(umo)
+            self.assertIn('新增抽选通知：开启', text)
+            self.assertIn('已发送' if umo == first else '发送失败', text)
+            self.assertEqual(before, self.service.db.notification_status(umo))
+            self.assertNotIn(second if umo == first else first, text)
+        retried = await self.service.claim_new_ticket_announcements(self.now)
+        self.assertEqual([r['umo'] for r in retried], [second])
+
+    async def test_status_explains_late_enable_and_old_whitelist_is_ticket_only(self):
+        self.add_event('late')
+        self.service.db.save_parsed('late', self.source, 'v1', 'test', [self.ticket('one')], [], [], [])
+        self.service.db.save_parsed('late', self.source, 'v2', 'test', [self.ticket('one'), self.ticket('two')], [], [], [])
+        umo = 'test:GroupMessage:late'
+        self.service.set_subscription('live', umo, True)
+        with self.service.db._connect() as db:
+            db.execute("UPDATE ticket_new_rounds SET observed_at='2000-01-01T00:00:00+00:00'")
+        self.assertIn('开启前发现', await self.service.notification_status(umo))
+        self.assertEqual(await self.service.claim_new_ticket_announcements(self.now), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = ImasLiveService(Path(tmp), {'white_umos': [umo]})
+            try:
+                self.assertFalse(legacy.subscription_enabled('live', umo))
+                self.assertTrue(legacy.subscription_enabled('ticket', umo))
+                self.assertIn('新增抽选通知：关闭', await legacy.notification_status(umo))
+            finally:
+                await legacy.close()

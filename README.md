@@ -7,6 +7,7 @@
 /imaslive 1—12
 /imaslive next [imas/cg/ml/sidem/sc/gk]
 /imaslive enable|disable
+/imaslive status
 /imasticket
 /imasticket get <活动编号>
 /imasticket enable|disable
@@ -45,6 +46,10 @@ v0.4.16 为每个转发节点添加最多一张官网封面，放在该活动详
 - 本地 Pillow 渲染，自动寻找 Windows 微软雅黑/游ゴシック或 Linux Noto CJK/文泉驿。Linux/Docker 环境需要安装中日文字体，例如 Debian/Ubuntu 的 `fonts-noto-cjk`，也可将字体挂载到容器内并配置 `font_path`。无需浏览器。
 
 ## WebUI 配置
+
+群内 `enable/disable` 保存到插件的 SQLite 数据库，与 WebUI 配置中的旧 `white_umos` 分开；清空配置、更新插件或重载不会清除群订阅。旧白名单仅首次迁移到抽票截止订阅，不会开启 LIVE 或新增抽选。新增抽选通知只发送给 LIVE 订阅群，只有 `/imasticket enable` 的群不会收到新增公告。
+
+v0.4.17 增加管理员只读命令 `/imaslive status`，在当前群查看两路订阅、后台和新增公告总开关、当前完整 UMO、本次 LIVE 启用时间、最近发现与本群最近三条新增公告投递结果；状态不联网、不改变订阅或通知去重记录。开启前已发现的抽选不补发。平台实例标识改变会产生不同 UMO，可用状态回执核对；不能只看群号判定同一订阅。无通知时，先比较两个群的状态和启用时间，再按日志中的目标 UMO 排查发送失败，不要直接清空数据库或已发送记录。提醒图倒计时不足一小时用分钟，一小时及以上用小时，最多一位小数，例如 1437 分钟显示约 24 小时。
 
 `/imaslive enable|disable` 与 `/imasticket enable|disable` 是 AstrBot 原生管理员命令，权限由 AstrBot 的管理员配置和指令管理统一决定；插件不维护 `admin_ids`，也不把消息平台的群管理员自动当作 AstrBot 管理员。普通用户仍可使用 LIVE、月份、`next`、抽票查询和 `get`。AstrBot 4.27.3 的指令组会强制把裸组名渲染为帮助，不能同时承载 `/imaslive` 这类默认查询；为了保留既有语法并消除重复注册告警，插件将 `imaslive`、`imaslive next`、`imaslive enable` 等注册为独立的原生命令。它们可在 WebUI 的“指令管理”中分别查看、启停或重命名。私聊不会设置订阅。`/imaslive enable` 同时控制 LIVE 开演前一小时提醒和新增现场抽选公告；`/imasticket enable` 只控制抽票截止前 24 小时与 1 小时提醒。两种订阅分别按完整 UMO 保存，互不影响。已订阅群在节点后短暂的发送或调度故障会在默认 20 分钟恢复窗口内重试；不会跨到下一节点、不会在截止后补发，重新开启订阅也不会回放旧提醒。
 
