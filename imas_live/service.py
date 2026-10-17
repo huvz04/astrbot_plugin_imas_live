@@ -22,7 +22,7 @@ import httpx
 from bs4 import BeautifulSoup
 from PIL import Image
 
-from .cms import CmsArticle, OfficialCmsClient, SourceUnavailable, event_root
+from .cms import CmsArticle, OfficialCmsClient, SourceUnavailable, event_root, event_brands
 from .database import Database
 from .parsing import parse_shiny_information, parse_day_cast, official_roster_image_urls, parse_ticket_page, parse_ticket_news, parse_venue, parse_information, schedule_performances, clean
 from .models import ParsedPage
@@ -201,6 +201,9 @@ class ImasLiveService:
                 self.db.set_meta('last_directory_sync', datetime.now(timezone.utc).isoformat(timespec='seconds'))
                 self.directory_ready.set()
                 self.directory_attempted.set()
+            if full_directory or directory_was_complete:
+                # New events can appear in news before the six-hour directory
+                # refresh. Discover and verify them in this same sync cycle.
                 await self._discover_news_sources()
                 known = await asyncio.to_thread(self.db.fetchable_events, max(1, int(self.config.get('max_special_pages', 12))))
                 articles = [CmsArticle(row['id'], row['title'], row['official_url'], json.loads(row['brands_json']), row['event_display'], row['venue'], row['source_updated'], {}) for row in known]
@@ -258,7 +261,8 @@ class ImasLiveService:
                     continue
                 marker = 'news_seen:' + str(item.get('_id') or page)
                 revision = str(item.get('updated') or '')
-                ticket_marker = 'news_ticket_seen:' + str(item.get('_id') or page)
+                legacy_ticket_marker = 'news_ticket_seen:' + str(item.get('_id') or page)
+                ticket_marker = 'news_ticket_seen_v2:' + str(item.get('_id') or page)
                 if self.db.meta(marker) == revision and self.db.meta(ticket_marker) == revision:
                     continue
                 if attempted >= 32:
@@ -269,6 +273,15 @@ class ImasLiveService:
                 except SourceUnavailable as exc:
                     errors.append(f'{page}: {exc}')
                     continue  # Leave the revision unacknowledged for a later retry.
+                try:
+                    news_updated = datetime.fromtimestamp(float(item.get('updated')), timezone.utc)
+                except (ValueError, TypeError, OSError, OverflowError):
+                    news_updated = None
+                announce = bool(baseline and news_updated and news_updated > baseline)
+                if self.db.meta(legacy_ticket_marker) == revision:
+                    # Revisit formerly unsupported layouts, with a bounded
+                    # catch-up for recent missed news rather than old backlog.
+                    announce = announce and news_updated >= datetime.fromisoformat(stamp) - timedelta(hours=72)
                 soup = BeautifulSoup(html, 'html.parser')
                 roots = {event_root(urljoin('https://idolmaster-official.jp/news/' + page + '.html', anchor['href']))
                          for anchor in soup.select('a[href]')}
@@ -288,12 +301,7 @@ class ImasLiveService:
                         brands = [str(b['code']) for b in item.get('brand', []) if isinstance(b, dict) and b.get('code')]
                         article = CmsArticle('news:' + hashlib.sha256(key.encode()).hexdigest()[:16], title,
                                              root, brands, None, None, item.get('updated'), {})
-                        try:
-                            news_updated = datetime.fromtimestamp(float(item.get('updated')), timezone.utc)
-                        except (ValueError, TypeError, OSError, OverflowError):
-                            news_updated = None
-                        self.db.upsert_event(self._event_record(article), bool(
-                            baseline and news_updated and news_updated > baseline))
+                        self.db.upsert_event(self._event_record(article), announce)
                         row = {'id': self.db.resolve_event_id(article.cms_id), 'official_url': root}
                         existing[key] = [row]
                     self.db.set_meta('refresh_hint:' + row['id'], stamp)
@@ -308,12 +316,8 @@ class ImasLiveService:
                                 known[event['id'] + ':' + t.stable_key].get('verified_source_url') == news_url]
                     if selected:
                         digest = hashlib.sha256(json.dumps([t.record() for t in selected], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-                        try:
-                            updated = datetime.fromtimestamp(float(item.get('updated')), timezone.utc)
-                        except (ValueError, TypeError, OSError, OverflowError):
-                            updated = None
-                        self.db.save_parsed(event['id'], news_url, digest, 'official-news-v1', selected, [], [], [],
-                                            ticket_only=True, announce_initial=bool(baseline and updated and updated > baseline))
+                        self.db.save_parsed(event['id'], news_url, digest, 'official-news-v2', selected, [], [], [],
+                                            ticket_only=True, announce_initial=announce)
                 self.db.set_meta(ticket_marker, revision)
                 self.db.set_meta(marker, revision)
             self.db.set_meta('last_news_discovery', stamp)
@@ -347,7 +351,7 @@ class ImasLiveService:
             'performances': [vars_for_slots(row) for row in parsed.performances],
             'cast': [vars_for_slots(row) for row in parsed.cast],
         }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        changed = await asyncio.to_thread(self.db.save_parsed, article.cms_id, article.url, digest, "special-page-v3", parsed.ticket_rounds, parsed.performances, parsed.cast, parsed.review_notes)
+        changed = await asyncio.to_thread(self.db.save_parsed, article.cms_id, article.url, digest, "special-page-v4", parsed.ticket_rounds, parsed.performances, parsed.cast, parsed.review_notes)
         assets = await self._cache_roster_assets(article.cms_id, article.url, parsed.cast_asset_urls)
         if assets:
             await asyncio.to_thread(self.db.save_cast_assets, article.cms_id, article.url, assets)
@@ -660,7 +664,7 @@ class ImasLiveService:
 
     @staticmethod
     def _event_record(article: CmsArticle) -> dict[str, Any]:
-        record = {"id": article.cms_id, "title": article.title, "brands": article.brands, "url": article.url,
+        record = {"id": article.cms_id, "title": article.title, "brands": event_brands(article.brands, article.url), "url": article.url,
                 "event_display": article.event_display, "venue": article.venue, "updated": article.updated}
         if 'thumbnail' in article.raw:
             record.update(thumbnail_url=cms_thumbnail_url(article.raw['thumbnail']),

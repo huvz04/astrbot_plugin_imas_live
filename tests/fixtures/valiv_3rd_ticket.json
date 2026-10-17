@@ -1,0 +1,35 @@
+{
+  "ticket": [
+    {
+      "title": "<p>＜アソビストア一般会員先行＞</p>",
+      "saleEnded": false,
+      "detailList": [
+        {
+          "fieldId": "ticketDetailItem",
+          "term": "受付期間",
+          "detail": "<p>2026年10月17日（土）21：30　～　11月15日（日）23：59</p>"
+        },
+        {
+          "fieldId": "ticketDetailItem",
+          "term": "受付URL",
+          "detail": "<p><a href=\"https://asobiticket2.asobistore.jp/receptions/a911b189-ae4a-4bc6-9f15-729201d4ff7c\" target=\"_blank\" rel=\"noopener noreferrer\">https://asobiticket2.asobistore.jp/receptions/a911b189-ae4a-4bc6-9f15-729201d4ff7c</a></p>"
+        },
+        {
+          "fieldId": "ticketDetailItem",
+          "term": "当落発表",
+          "detail": "<p>2026年11月28日（土）13：00　～</p>"
+        },
+        {
+          "fieldId": "ticketDetailItem",
+          "term": "入金期間",
+          "detail": "<p>2026年11月28日（土）13：00　～　12月2日（水）23：59</p>"
+        },
+        {
+          "fieldId": "ticketDetailItem",
+          "term": "枚数制限",
+          "detail": "<p>お一人様各公演2枚まで（複数公演申込可能）</p>"
+        }
+      ]
+    }
+  ]
+}

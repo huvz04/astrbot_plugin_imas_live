@@ -272,7 +272,7 @@ def parse_venue(html: str) -> str | None:
 
 
 def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
-    """Extract ticket rows from Gakuen, SideM and Shiny's known layouts."""
+    """Extract ticket rows from verified special-page and CMS field layouts."""
     soup = _page_soup(html)
     parsed = ParsedPage()
     seen: set[str] = set()
@@ -301,6 +301,8 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         period = _field(pairs, "受付期間", "申込期間", "販売期間")
         ticket_url = _field(pairs, "受付URL", "販売URL")
         links = _links(node, source_url)
+        # CMS URL components can contain plain text instead of an anchor.
+        links.extend(re.findall(r'https?://[^\s<>"\u3000]+', ticket_url or ''))
         if not period and not ticket_url and not links:
             continue
         title = re.sub(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s*Update!?|受付(?:は)?終了しました|受付終了|終了しました', '', _nearest_title(node), flags=re.I).strip()
@@ -317,6 +319,8 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         pay_start, pay_end = _range(_field(pairs, "入金期間", "支払期間"))
         urls = list(dict.fromkeys(item for item in links if 'asobiticket' in item and '/receptions/' in item))
         if not urls:
+            urls = list(dict.fromkeys(item for item in links if urlsplit(item).hostname in {'livepocket.jp', 't.livepocket.jp'} and urlsplit(item).path.startswith('/e/')))
+        if not urls:
             urls = [next((item for item in links if "ticket" in item or "asobi" in item or "eplus" in item or "l-tike" in item), None)]
         evidence = Evidence(source_url, whole[:400], "ticket-html")
         if period and (start is None or end is None):
@@ -330,7 +334,10 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
             url = canonical_reception_url(url) or url
             # Distinct official reception links (e.g. VIP and normal seats)
             # must survive; date edits never change their identities.
-            key = stable(url) if url else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
+            # A LivePocket event URL is reused across first/second rounds.
+            # Keep the existing source/title identity used before URL recovery.
+            livepocket = bool(url and urlsplit(url).hostname in {'livepocket.jp', 't.livepocket.jp'})
+            key = stable(url) if url and not livepocket else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
             if key in seen:
                 continue
             seen.add(key)
@@ -367,9 +374,10 @@ def parse_ticket_news(html: str, source_url: str) -> list[TicketRound]:
         heading = block.find_previous(['h2', 'h3', 'h4', 'h5', 'h6'])
         title = clean(heading.get_text(' ')) if heading else ''
         scope_heading = heading.find_previous(['h2', 'h3', 'h4']) if heading else None
-        if not scope_heading or '現地チケット' not in clean(scope_heading.get_text(' ')) or _method(title) not in {'lottery', 'resale'}:
+        scope_title = title + ' ' + (clean(scope_heading.get_text(' ')) if scope_heading else '')
+        if '現地チケット' not in scope_title or _method(title) not in {'lottery', 'resale'}:
             continue
-        lines = [clean(line).strip('✦★●・ ') for line in block.get_text('\n', strip=True).splitlines()]
+        lines = [clean(line).strip('✦★●・〇○ ') for line in block.get_text('\n', strip=True).splitlines()]
         fields = {}
         for i, line in enumerate(lines[:-1]):
             if line in {'受付期間', '当落発表', '入金期間', '受付対象席種'}:
@@ -436,8 +444,53 @@ def schedule_performances(text: str, source_url: str, venue: str | None = None,
     return rows
 
 
+def _valiv_information(soup: BeautifulSoup, source_url: str) -> list[Performance]:
+    """Read explicit city/day/session cards on the official vα-liv event site."""
+    parts = urlsplit(source_url)
+    if parts.hostname != 'idolmaster-official.jp' or not parts.path.startswith('/va-liv/event/'):
+        return []
+    venues = {}
+    for heading in soup.find_all('h4'):
+        if clean(heading.get_text(' ')) == '公演場所':
+            for area in heading.parent.select('[data-area]'):
+                venue = area.select_one('[class*="venue_place__"]')
+                if venue:
+                    venues[area['data-area']] = clean(venue.get_text(' '))
+    rows = {}
+    for heading in soup.find_all('h4'):
+        if clean(heading.get_text(' ')) != 'スケジュール':
+            continue
+        for area in heading.parent.select('[data-area]'):
+            for day in area.select('[class*="style_day__"]'):
+                date_node = day.select_one('[class*="day_date__"]')
+                day_value = date_only(date_node.get_text(' ')) if date_node else None
+                if not day_value:
+                    continue  # A year must be published in this day heading.
+                for show in day.select('dl[class*="performance__"]'):
+                    title = _field(_pairs(show), 'タイトル')
+                    if not title:
+                        continue
+                    for dt in show.select('dt'):
+                        label = clean(dt.get_text(' ')).rstrip(':')
+                        dd = dt.find_next_sibling('dd')
+                        if label not in {'公演時間', '昼公演', '夜公演'} or dd is None:
+                            continue
+                        value = clean(dd.get_text(' '))
+                        clock = re.search(r'開場\s*/\s*開演\s*(\d{1,2}:\d{2})\s*/\s*(\d{1,2}:\d{2})', value)
+                        if not clock or not japan_datetime(day_value.replace('-', '/')+' '+clock[2]):
+                            continue
+                        key = stable(source_url, area['data-area'], day_value, title, label)
+                        rows[key] = Performance(key, day_value, title+'｜'+label+'｜开演 '+clock[2]+' JST',
+                            venues.get(area['data-area']),
+                            evidence=Evidence(source_url, day_value+' '+title+' '+value, 'valiv-schedule-html'))
+    return list(rows.values())
+
+
 def parse_information(html: str, source_url: str) -> list[Performance]:
     soup = _page_soup(html)
+    valiv = _valiv_information(soup, source_url)
+    if valiv:
+        return valiv
     labels = {'公演日時', '開催日時', '日程', '公演日程', '日時', '開催日'}
     for node in soup.find_all(['dt', 'h2', 'h3', 'h4']):
         label = re.sub(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s*Update', '', clean(node.get_text(' '))).strip()

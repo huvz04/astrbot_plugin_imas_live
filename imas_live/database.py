@@ -250,7 +250,7 @@ class Database:
         # article is not an event identity. Only tracking/trailing slash differ.
         if parts.scheme.lower() != 'https' or parts.netloc.lower() != 'idolmaster-official.jp':
             return ''
-        if not re.match(r'^/(live_events?|lp)/[^/]+/?$', parts.path):
+        if not re.fullmatch(r'/(?:live_events?|lp)/[^/]+/?|/va-liv/event/[A-Za-z0-9_-]+/?', parts.path):
             return ''
         return 'https://idolmaster-official.jp' + parts.path.rstrip('/')
 

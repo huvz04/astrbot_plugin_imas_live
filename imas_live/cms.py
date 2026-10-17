@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
+from html import escape
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any
@@ -21,7 +23,16 @@ def event_root(url: str | None) -> str | None:
     path = parts.path.strip('/').split('/')
     if parts.scheme == 'https' and parts.netloc == 'idolmaster-official.jp' and len(path) >= 2 and path[0] in ('live_event', 'live_events', 'lp'):
         return f'{OFFICIAL}/{path[0]}/{path[1]}/'
+    if parts.scheme == 'https' and parts.netloc == 'idolmaster-official.jp' and len(path) >= 3 and path[:2] == ['va-liv', 'event'] and re.fullmatch(r'[A-Za-z0-9_-]+', path[2]):
+        return f'{OFFICIAL}/va-liv/event/{path[2]}/'
     return None
+
+
+def event_brands(brands: list[str], url: str | None) -> list[str]:
+    path = urlsplit(url or '').path
+    if event_root(url) and (path.startswith('/va-liv/event/') or path.startswith('/live_events/va-liv_')):
+        return list(dict.fromkeys([b for b in brands if b != 'OTHER'] + ['VALIV']))
+    return brands
 
 
 class SourceUnavailable(RuntimeError):
@@ -145,7 +156,29 @@ class OfficialCmsClient:
             return await self.article_content(urlsplit(root).path.strip('/').split('/')[1], 'detail_page')
         if root and '/lp/' in root:
             return await self.article_content(urlsplit(root).path.strip('/').split('/')[1], 'lp_detail')
-        return await self.fetch_html(url)
+        html = await self.fetch_html(url)
+        # Verified from this page's own Next.js bundle. Its SSR ticket section
+        # is empty; the browser fills it from this public same-origin JSON.
+        if root == OFFICIAL + '/va-liv/event/3rd_live/':
+            try:
+                data = json.loads(await self.fetch_html(OFFICIAL + '/cdn/mcms/va-liv/3rd_live/data.json'))
+                tickets = data['ticket']
+                if not isinstance(tickets, list):
+                    raise ValueError('ticket list')
+                sections = []
+                for ticket in tickets:
+                    if not isinstance(ticket['title'], str) or not isinstance(ticket['detailList'], list):
+                        raise ValueError('ticket fields')
+                    fields = []
+                    for field in ticket['detailList']:
+                        if not isinstance(field['term'], str) or not isinstance(field['detail'], str):
+                            raise ValueError('ticket detail')
+                        fields.append('<dt>'+escape(field['term'])+'</dt><dd>'+field['detail']+'</dd>')
+                    sections.append('<section class="p-ticket__group"><h2>'+ticket['title']+'</h2><dl>'+''.join(fields)+'</dl></section>')
+                html += ''.join(sections)
+            except (ValueError, TypeError, KeyError):
+                raise SourceUnavailable('vα-liv 官方票务 JSON 结构异常，保留旧记录') from None
+        return html
 
     async def recent_news(self) -> list[dict[str, Any]]:
         """Bounded discovery feed; never claim this is a complete news archive."""
@@ -218,5 +251,5 @@ class OfficialCmsClient:
             url = f"{OFFICIAL}/lp/{item['path']}"
         return CmsArticle(
             str(item.get("_id", "")), str(item.get("title", "")), str(url) if url else None,
-            brands, item.get("event_dspdate"), item.get("event_place"), item.get("updated"), item,
+            event_brands(brands, str(url) if url else None), item.get("event_dspdate"), item.get("event_place"), item.get("updated"), item,
         )
