@@ -154,7 +154,7 @@ class TicketNewAlertTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.service.subscription_enabled('ticket', umo))
             before = self.service.db.notification_status(umo)
             text = await self.service.notification_status(umo)
-            self.assertIn('新增抽选通知：开启', text)
+            self.assertIn('新增票务通知：开启', text)
             self.assertIn('已发送' if umo == first else '发送失败', text)
             self.assertEqual(before, self.service.db.notification_status(umo))
             self.assertNotIn(second if umo == first else first, text)
@@ -176,7 +176,7 @@ class TicketNewAlertTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertFalse(legacy.subscription_enabled('live', umo))
                 self.assertTrue(legacy.subscription_enabled('ticket', umo))
-                self.assertIn('新增抽选通知：开启', await legacy.notification_status(umo))
+                self.assertIn('新增票务通知：开启', await legacy.notification_status(umo))
             finally:
                 await legacy.close()
 

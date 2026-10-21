@@ -74,7 +74,8 @@ class ImasLiveService:
         # never copied to the newly introduced LIVE reminder table.
         self.db.migrate_legacy_ticket_subscriptions(self.config.get("white_umos", []))
         self._ticket_new_channel_baseline = self.db.migrate_ticket_new_channel()
-        self.db.recover_recent_resale_notices()
+        self.db.recover_recent_ticket_notices('resale')
+        self.db.recover_recent_ticket_notices('numbered')
         self.client = OfficialCmsClient(float(self.config.get("request_timeout_seconds", 25)))
         self._sync_lock = asyncio.Lock()
         self.directory_ready = asyncio.Event()
@@ -110,9 +111,9 @@ class ImasLiveService:
             '后台通知总开关：'+('开启' if enabled else '关闭'),
             '本群 LIVE 订阅：'+('开启' if live.get('enabled') else '关闭／未订阅'),
             '本群票务订阅：'+('开启' if ticket.get('enabled') else '关闭／未订阅'),
-            '新增抽选通知：'+('开启' if announcements and ticket.get('enabled') else '关闭')]
+            '新增票务通知：'+('开启' if announcements and ticket.get('enabled') else '关闭')]
         if not announcements:
-            lines.append('新增抽选被 WebUI 总开关或新增公告开关关闭。')
+            lines.append('新增票务被 WebUI 总开关或新增公告开关关闭。')
         if live.get('enabled'):
             lines.append('本次 LIVE 启用：'+stamp(live.get('updated_at'))+' 北京时间')
         if ticket.get('enabled'):
@@ -128,11 +129,11 @@ class ImasLiveService:
                 lines.append('最近这条在本群票务开启前发现，按规则不补发。')
         states = {'sent': '已发送', 'failed': '发送失败', 'inflight': '发送处理中'}
         if snapshot['deliveries']:
-            lines.append('本群最近新增抽选投递：')
+            lines.append('本群最近新增票务投递：')
             lines.extend(stamp(row['updated_at'])+'｜'+states.get(row['state'], row['state'])+'｜'+row['payload'][:100]
                          for row in snapshot['deliveries'])
         else:
-            lines.append('本群暂无新增抽选投递记录。')
+            lines.append('本群暂无新增票务投递记录。')
         lines.append('群订阅保存在插件数据库；WebUI 白名单为空不会清除。')
         lines.append('开演提醒用 /imaslive enable|disable；新增抽选与截止提醒用 /imasticket enable|disable。')
         return '\n'.join(lines)
@@ -258,12 +259,12 @@ class ImasLiveService:
             for item in news:
                 title, page = str(item.get('title', '')), str(item.get('path') or '')
                 if not page or not re.fullmatch(r'[A-Za-z0-9_-]+', page) or not any(
-                        term in title.casefold() for term in ('live', 'ライブ', '公演', 'チケット', '先行', '抽選', 'concert')):
+                        term in title.casefold() for term in ('live', 'ライブ', '公演', 'チケット', '先行', '抽選', '整理券', 'concert')):
                     continue
                 marker = 'news_seen:' + str(item.get('_id') or page)
                 revision = str(item.get('updated') or '')
-                legacy_ticket_marker = 'news_ticket_seen:' + str(item.get('_id') or page)
-                ticket_marker = 'news_ticket_seen_v2:' + str(item.get('_id') or page)
+                legacy_ticket_markers = [prefix + str(item.get('_id') or page) for prefix in ('news_ticket_seen:', 'news_ticket_seen_v2:')]
+                ticket_marker = 'news_ticket_seen_v3:' + str(item.get('_id') or page)
                 if self.db.meta(marker) == revision and self.db.meta(ticket_marker) == revision:
                     continue
                 if attempted >= 32:
@@ -279,7 +280,7 @@ class ImasLiveService:
                 except (ValueError, TypeError, OSError, OverflowError):
                     news_updated = None
                 announce = bool(baseline and news_updated and news_updated > baseline)
-                if self.db.meta(legacy_ticket_marker) == revision:
+                if any(self.db.meta(key) == revision for key in legacy_ticket_markers):
                     # Revisit formerly unsupported layouts, with a bounded
                     # catch-up for recent missed news rather than old backlog.
                     announce = announce and news_updated >= datetime.fromisoformat(stamp) - timedelta(hours=72)
@@ -317,7 +318,7 @@ class ImasLiveService:
                                 known[event['id'] + ':' + t.stable_key].get('verified_source_url') == news_url]
                     if selected:
                         digest = hashlib.sha256(json.dumps([t.record() for t in selected], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-                        self.db.save_parsed(event['id'], news_url, digest, 'official-news-v2', selected, [], [], [],
+                        self.db.save_parsed(event['id'], news_url, digest, 'official-news-v3', selected, [], [], [],
                                             ticket_only=True, announce_initial=announce)
                 self.db.set_meta(ticket_marker, revision)
                 self.db.set_meta(marker, revision)
@@ -547,7 +548,14 @@ class ImasLiveService:
             if url in visited:
                 continue
             visited.add(url)
-            html = await self.client.event_html(url)
+            goods_page = '/goods/' in urlsplit(url).path
+            try:
+                html = await self.client.event_html(url)
+            except SourceUnavailable:
+                if not goods_page:
+                    raise
+                result.review_notes.append('整理券来源暂不可用：'+url)
+                continue  # Optional goods failure must not disable verified LIVE/tickets.
             soup = BeautifulSoup(html, 'html.parser')
             if url == article.url:
                 result.cover_url = og_cover_url(html, article.url)
@@ -562,15 +570,22 @@ class ImasLiveService:
                         queue.insert(0, destination)
                         break
             parsed = parse_ticket_page(html, url)
-            if not parsed.ticket_rounds and any(
+            if goods_page:
+                parsed.ticket_rounds = [row for row in parsed.ticket_rounds if row.ticket_scope == 'numbered']
+                if selected_stop and url.endswith('.php') and url.rsplit('/', 1)[-1] != selected_stop:
+                    # A goods landing page can redirect to another city. Read
+                    # its navigation, but never attach that city's receptions.
+                    parsed.ticket_rounds = []
+            if not goods_page and not parsed.ticket_rounds and any(
                     clean(dt.get_text(' ')) in {'受付期間', '申込期間', '販売期間'} for dt in soup.select('dt')):
                 raise SourceUnavailable('官网有申请字段但未能解析票务轮次，保留旧记录')
             result.review_notes.extend(parsed.review_notes)
             for row in parsed.ticket_rounds:
                 ticket_rows[row.stable_key] = row
                 ticket_cities.setdefault(row.stable_key, set()).add(urlsplit(url).path.rsplit('/', 1)[-1])
-            result.cast_asset_urls.extend(official_roster_image_urls(html, url))
-            performances = parse_information(html, url)
+            if not goods_page:
+                result.cast_asset_urls.extend(official_roster_image_urls(html, url))
+            performances = [] if goods_page else parse_information(html, url)
             if performances and (not result.performances or '/information' in url):
                 if '/information' in url:
                     if not information_seen:
@@ -585,13 +600,13 @@ class ImasLiveService:
                         city_performances[city] = [merged[(p.date, p.session_label, p.venue)].stable_key for p in performances]
                 else:
                     result.performances = performances
-            if '283production_msp' in root:
+            if not goods_page and '283production_msp' in root:
                 cast_data = parse_shiny_information(html, url)
                 if cast_data.cast:
                     for row in cast_data.performances:
                         row.venue = parse_venue(html) or article.venue
                     cast_pages.append(cast_data)
-            elif 'cast' in url.lower() or '出演者' in clean(soup.get_text(' ')):
+            elif not goods_page and ('cast' in url.lower() or '出演者' in clean(soup.get_text(' '))):
                 cast_data = parse_day_cast(html, url)
                 if cast_data.cast:
                     cast_pages.append(cast_data)
@@ -601,9 +616,13 @@ class ImasLiveService:
                     content = meta.get('content', '')
                     if 'url=' in content.lower():
                         destinations.append(urljoin(url, content.split('=', 1)[1].strip(' \"\'')))
+            redirects = set(destinations)
             for a in soup.select('a[href]'):
                 destination = urldefrag(urljoin(url, a['href']))[0]
                 if any(part in destination[len(root):].lower() for part in ('ticket', 'information', 'cast')):
+                    destinations.append(destination)
+                path = urlsplit(destination).path
+                if '/goods/' in path and (path.endswith('/') or path.endswith(('.php', '.html', '.htm'))):
                     destinations.append(destination)
                 target_root = event_root(destination)
                 if '/live_events/' in root and target_root and '/live_event/' in target_root and any(
@@ -614,12 +633,16 @@ class ImasLiveService:
                 if not any(destination.startswith(allowed) for allowed in roots) or destination in visited or destination in queue:
                     continue
                 if selected_stop and destination.endswith('.php') and destination.rsplit('/', 1)[-1] != selected_stop:
-                    continue
+                    if not (goods_page and url.endswith('/goods/') and destination in redirects):
+                        continue
                 if 'gkmas_livetour_shirube' in root and not selected_stop and destination != article.url:
                     continue
                 queue.append(destination)
-        if queue:
+            queue.sort(key=lambda target: '/goods/' in urlsplit(target).path)
+        if any('/goods/' not in urlsplit(target).path for target in queue):
             raise SourceUnavailable('专题链接超过单轮8页上限，未完成核验，保留旧记录')
+        if queue:
+            result.review_notes.append('整理券页面超出本轮抓取上限，未核验的旧记录保持待核验。')
         for cast_data in cast_pages:
             # A day-level CAST heading cannot replace precise information-page
             # clocks or discard other cities. Bind its roster to known sessions.
@@ -804,7 +827,7 @@ class ImasLiveService:
             return False
 
     async def ticket_entries(self, current: datetime | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str]:
-        """Show only freshly verified, currently accepting onsite rounds."""
+        """Show only freshly verified, currently accepting tickets and slips."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
         start, end, _ = self._month_window(current, None)
@@ -992,6 +1015,8 @@ class ImasLiveService:
             status, label = "open", "抽选中"
         if row.get('sale_method') == 'resale':
             label = '转售 · ' + ('受理中' if status == 'open' else label)
+        if row.get('ticket_scope') == 'numbered':
+            label = '整理券 · ' + ('受理中' if status == 'open' else label)
         if not self._source_is_fresh(row, current):
             return ("ended" if status == "ended" else "stale"), label + " · 待核验"
         return status, label
@@ -1084,7 +1109,7 @@ class ImasLiveService:
         performances = detail['performances'] or [vars_for_slots(p) for p in schedule_performances(
             event.get('event_display') or '', event.get('official_url') or '', event.get('venue'))]
         live_pending = self._ticket_event_window(performances, current, zone)[0]
-        tickets = [row for row in detail["tickets"] if row.get("ticket_scope") == "onsite"]
+        tickets = [row for row in detail["tickets"] if row.get("ticket_scope") in {"onsite", "numbered"}]
         evidence_rows = {row['id']: row for row in await asyncio.to_thread(self.db.ticket_query_rows)}
         result: list[dict[str, Any]] = []
         for row in tickets:
@@ -1093,7 +1118,7 @@ class ImasLiveService:
             ticket_status, status = self._ticket_display_status(evidence_row, current)
             deadline = self._ticket_moment(row.get('application_end'))
             expired = not live_pending or bool(deadline and current >= deadline)
-            if row["sale_method"] == "first_come":
+            if row["sale_method"] == "first_come" and row['ticket_scope'] != 'numbered':
                 status, ticket_status = "一般销售/先到先得", "unknown"
             details = [f"{status}｜{row['name']}"]
             if row.get("application_end"):
@@ -1217,6 +1242,8 @@ class ImasLiveService:
                 status, ticket_status = "新抽选已公布／起止时间待核验", "unknown"
             if row['sale_method'] == 'resale':
                 status = status.replace('新抽选', '新增转售')
+            if row['ticket_scope'] == 'numbered':
+                status = status.replace('新抽选', '新增整理券')
             times: list[str] = []
             if start and start.tzinfo:
                 times.append(self._ticket_time(row["application_start"], "开始", zone))

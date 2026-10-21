@@ -13,3 +13,4 @@ Additional reduced public excerpts checked on 2026-10-18:
 - `valiv_letora_ticket.html`: ticket CMS components from https://idolmaster-official.jp/live_events/va-liv_letora_bd2026; first and second rounds share a plain-text LivePocket event URL.
 
 - `gakuen_final_resale.html`: reduced ticket fields checked on 2026-10-21 from https://idolmaster-official.jp/live_event/gkmas_livetour_shirube/ticket/final.php; the 2026-10-20 resale update contains separate reception URLs for November 7 and 8.
+- `gakuen_numbered.html`: historical numbered goods-admission fields checked on 2026-10-21 from https://idolmaster-official.jp/live_event/gkmas_livetour_shirube/goods/iwate.php; these fields give reception timestamps but do not explicitly state lottery versus first-come.

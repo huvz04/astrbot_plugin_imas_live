@@ -134,12 +134,12 @@ class ImasLivePlugin(Star):
                     image = await asyncio.to_thread(
                         self.renderer.render_reminder, batch,
                         datetime.now(ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))),
-                        "IMAS 新增现场抽选" if is_new else "IMAS 现场提醒",
+                        "IMAS 新增票务" if is_new else "IMAS 现场提醒",
                         "请核对官方申请页面" if is_new else "请核对官方页面",
                         not is_new,
                     )
                     links = "\n".join(f"官方链接：{url}" for url in dict.fromkeys(row["url"] for row in batch if row["url"]))
-                    message = MessageChain().message(("IM@S 新增现场抽选\n" if is_new else "IM@S 提醒\n") + links).file_image(str(image))
+                    message = MessageChain().message(("IM@S 新增票务\n" if is_new else "IM@S 提醒\n") + links).file_image(str(image))
                     ok = bool(await self.context.send_message(umo, message))
                     if not ok:
                         logger.warning("IM@S %s reminder send returned false: umo=%s count=%s", kind, umo, len(batch))
@@ -386,7 +386,7 @@ class ImasLivePlugin(Star):
 
     @filter.command("imasticket")
     async def imasticket(self, event: AstrMessageEvent, action: str = "", extra_argument: str = ""):
-        """按 LIVE 开始时间显示当前正在受理的现场抽选、转售。"""
+        """按 LIVE 开始时间显示当前正在受理的抽选、转售和整理券。"""
         if action.casefold() in {"get", "enable", "disable", "status"}:
             return
         event.stop_event()
@@ -445,7 +445,7 @@ class ImasLivePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasticket enable")
     async def imasticket_enable(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """管理员：开启本群新增抽选公告与抽票截止提醒。"""
+        """管理员：开启本群抽选、转售、整理券的新增及截止提醒。"""
         event.stop_event()
         if extra_argument:
             await event.send(event.plain_result("用法：/imasticket enable"))
@@ -455,12 +455,12 @@ class ImasLivePlugin(Star):
             await event.send(event.plain_result("票务订阅只能在群内设置。"))
             return
         self.service.set_subscription("ticket", umo, True)
-        await event.send(event.plain_result("已开启本群新增现场抽选公告与抽票截止提醒（截止前 24 小时和 1 小时各一次）。"))
+        await event.send(event.plain_result("已开启本群抽选、转售、整理券的新增公告与截止提醒（截止前 24 小时和 1 小时各一次）。"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("imasticket disable")
     async def imasticket_disable(self, event: AstrMessageEvent, extra_argument: str = ""):
-        """管理员：关闭本群新增抽选公告与抽票截止提醒。"""
+        """管理员：关闭本群抽选、转售、整理券的新增及截止提醒。"""
         event.stop_event()
         if extra_argument:
             await event.send(event.plain_result("用法：/imasticket disable"))
@@ -470,7 +470,7 @@ class ImasLivePlugin(Star):
             await event.send(event.plain_result("票务订阅只能在群内设置。"))
             return
         self.service.set_subscription("ticket", umo, False)
-        await event.send(event.plain_result("已关闭本群新增现场抽选公告与抽票截止提醒。"))
+        await event.send(event.plain_result("已关闭本群抽选、转售、整理券的新增公告与截止提醒。"))
 
     async def terminate(self):
         for task in (self._sync_task, self._reminder_task):

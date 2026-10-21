@@ -73,9 +73,11 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(any(item.sale_method == "resale" and item.ticket_scope == "onsite" for item in result.ticket_rounds))
 
 
-    def test_shiny_goods_ticket_does_not_become_onsite_ticket(self):
+    def test_shiny_numbered_ticket_is_distinct_from_onsite_and_general_goods(self):
         result = parse_ticket_page(fixture("shiny_single_page.html"), "https://idolmaster-official.jp/live_event/283production_msp/")
-        self.assertTrue(any(item.ticket_scope == "goods" for item in result.ticket_rounds))
+        numbered = [item for item in result.ticket_rounds if '整理券' in item.name]
+        self.assertTrue(numbered)
+        self.assertTrue(all(item.ticket_scope == "numbered" for item in numbered))
 
 
     def test_shiny_cast_is_announced_and_day_specific(self):

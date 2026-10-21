@@ -47,7 +47,7 @@ def _page_soup(html: str) -> BeautifulSoup:
     for node in soup.select('[data-type="component-livetext_v2"]'):
         label = clean(node.get_text(' '))
         if label not in labels:
-            if len(label) < 160 and _method(label) != 'unknown':
+            if len(label) < 160 and (_method(label) != 'unknown' or '整理券' in label):
                 flush()
                 title = label
             continue
@@ -177,7 +177,7 @@ def _nearest_title(node: Tag) -> str:
     while ancestor:
         if ancestor.name in {"section", "details", "dl"}:
             title = ancestor.find(["h2", "h3", "h4", "summary", "dt"], recursive=False)
-            if title and not any(term in clean(title.get_text(' ')) for term in ('受付期間', '受付URL', '入金期間', '当落発表')):
+            if title and not any(term in clean(title.get_text(' ')) for term in ('受付期間', '申込期間', '販売期間', '受付URL', '販売URL', '入金期間', '当落発表')):
                 return clean(title.get_text(" "))
         ancestor = ancestor.parent if isinstance(ancestor.parent, Tag) else None
     previous = node.find_previous(["h2", "h3", "h4"])
@@ -187,12 +187,16 @@ def _nearest_title(node: Tag) -> str:
 def _scope(text: str) -> str:
     if any(key in text for key in ("配信", "視聴", "streaming")):
         return "streaming"
+    if '整理券' in text:
+        return 'numbered'
     if any(key in text for key in ("物販", "グッズ", "整理券", "CD・映像")):
         return "goods"
     return "onsite"
 
 
 def _method(text: str) -> str:
+    # "先着順ではございません" explicitly describes a lottery, not first-come.
+    text = re.sub(r'先着(?:順)?では(?:ございません|ありません|ない|なく)', '', text)
     if "リセール" in text:
         return "resale"
     if "先着" in text or "一般販売" in text:
@@ -318,6 +322,16 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
         result = japan_datetime(_field(pairs, "当落発表", "結果発表") or "")
         pay_start, pay_end = _range(_field(pairs, "入金期間", "支払期間"))
         urls = list(dict.fromkeys(item for item in links if 'asobiticket' in item and '/receptions/' in item))
+        if scope == 'numbered':
+            application_links = []
+            for dt in node.select('dt'):
+                if any(label in clean(dt.get_text(' ')) for label in ('受付URL', '販売URL')):
+                    dd = dt.find_next_sibling('dd')
+                    if dd:
+                        application_links.extend(_links(dd, source_url))
+            application_links.extend(re.findall(r'https?://[^\s<>"\u3000]+', ticket_url or ''))
+            if application_links:
+                urls = list(dict.fromkeys(application_links))
         if not urls:
             urls = list(dict.fromkeys(item for item in links if urlsplit(item).hostname in {'livepocket.jp', 't.livepocket.jp'} and urlsplit(item).path.startswith('/e/')))
         if not urls:
@@ -336,8 +350,9 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
             # must survive; date edits never change their identities.
             # A LivePocket event URL is reused across first/second rounds.
             # Keep the existing source/title identity used before URL recovery.
-            livepocket = bool(url and urlsplit(url).hostname in {'livepocket.jp', 't.livepocket.jp'})
-            key = stable(url) if url and not livepocket else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
+            source_identity = bool(url and (urlsplit(url).hostname in {'livepocket.jp', 't.livepocket.jp'} or
+                                   (scope == 'numbered' and canonical_reception_url(url) is None)))
+            key = stable(url) if url and not source_identity else stable(source_url, title, _field(pairs, "対象席種", "券種") or '')
             if key in seen:
                 continue
             seen.add(key)
@@ -353,7 +368,7 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
                             clean(seat_heading.get_text(' ')) if seat_heading else '')
             parsed.ticket_rounds.append(TicketRound(
                 stable_key=key, name=title + ('｜' + link_label if link_label else ''), ticket_scope=scope,
-                sale_method=_method(title + " " + whole[:300]),
+                sale_method=_method(title) if _method(title) != 'unknown' else _method(whole[:300]),
                 application_start=start, application_end=end, result_at=result,
                 payment_start=pay_start, payment_end=pay_end, url=url,
                 seats=_field(pairs, "対象席種", "券種", "チケット料金"),
@@ -369,15 +384,17 @@ def parse_ticket_news(html: str, source_url: str) -> list[TicketRound]:
     soup = BeautifulSoup(html, 'html.parser')
     rows = {}
     for block in soup.select('.c-txt'):
-        links = list(dict.fromkeys(a['href'] for a in block.select('a[href]')
-                                  if a['href'].startswith('https://asobiticket2.asobistore.jp/receptions/')))
-        if not links:
-            continue
         heading = block.find_previous(['h2', 'h3', 'h4', 'h5', 'h6'])
         title = clean(heading.get_text(' ')) if heading else ''
         scope_heading = heading.find_previous(['h2', 'h3', 'h4']) if heading else None
         scope_title = title + ' ' + (clean(scope_heading.get_text(' ')) if scope_heading else '')
-        if '現地チケット' not in scope_title or _method(title) not in {'lottery', 'resale'}:
+        numbered = _scope(title if '整理券' in title else scope_title) == 'numbered'
+        if not numbered and ('現地チケット' not in scope_title or _method(title) not in {'lottery', 'resale'}):
+            continue
+        # News supplements only independently identified ASOBI receptions.
+        # Other providers are read in the event page's own labelled fields.
+        links = list(dict.fromkeys(a['href'] for a in block.select('a[href]') if canonical_reception_url(a['href'])))
+        if not links:
             continue
         lines = [clean(line).strip('✦★●・〇○ ') for line in block.get_text('\n', strip=True).splitlines()]
         fields = {}
@@ -393,7 +410,7 @@ def parse_ticket_news(html: str, source_url: str) -> list[TicketRound]:
         pay_start, pay_end = _range(fields.get('入金期間'))
         for link in links:
             link = canonical_reception_url(link) or link
-            row = TicketRound(stable(link), title, 'onsite', _method(title), start, end,
+            row = TicketRound(stable(link), title, 'numbered' if numbered else 'onsite', _method(title), start, end,
                               result_at=japan_datetime(fields.get('当落発表', '')),
                               payment_start=pay_start, payment_end=pay_end, url=link,
                               seats=fields.get('受付対象席種'),

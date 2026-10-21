@@ -290,7 +290,7 @@ class CalendarRenderer:
         draw.text((48, 28), 'Ticket Overview', font=self.font(42, True), fill='white')
         y = 140
         if not cards:
-            message = '数据尚未同步完成，请稍后再发送 /imasticket。' if '尚未同步' in status else '暂无正在受理的现场抽选或转售。'
+            message = '数据尚未同步完成，请稍后再发送 /imasticket。' if '尚未同步' in status else '暂无正在受理的抽选、转售或整理券。'
             draw.text((48, y+48), message, font=self.font(30, True), fill='#25324a')
         for card in cards:
             self._draw_card(draw, card, y)
