@@ -386,7 +386,7 @@ class ImasLivePlugin(Star):
 
     @filter.command("imasticket")
     async def imasticket(self, event: AstrMessageEvent, action: str = "", extra_argument: str = ""):
-        """按 LIVE 开始时间显示演出前已收录的现场抽选、转售及各轮状态。"""
+        """按 LIVE 开始时间显示当前正在受理的现场抽选、转售。"""
         if action.casefold() in {"get", "enable", "disable", "status"}:
             return
         event.stop_event()

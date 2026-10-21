@@ -107,7 +107,7 @@ class TicketSourceWorkflow(unittest.IsolatedAsyncioTestCase):
     def ticket(self, key, start, end, scope='onsite', method='lottery'):
         return TicketRound(key, key, scope, method, start.isoformat(), end.isoformat(), evidence=Evidence(ROOT, 'official', 'test'))
 
-    async def test_all_rounds_grouped_far_future_live_and_no_false_deadline_alerts(self):
+    async def test_active_rounds_only_for_far_future_live_and_no_false_deadline_alerts(self):
         rows = [self.ticket('open', NOW-timedelta(days=1), NOW+timedelta(days=5)),
                 self.ticket('future', NOW+timedelta(days=2), NOW+timedelta(days=3)),
                 self.ticket('ended', NOW-timedelta(days=2), NOW-timedelta(hours=1)),
@@ -116,8 +116,8 @@ class TicketSourceWorkflow(unittest.IsolatedAsyncioTestCase):
         self.seed('feb-live', rows)
         self.seed('another', [self.ticket('urgent', NOW-timedelta(days=1), NOW+timedelta(hours=1))])
         entries, *_ = await self.service.ticket_entries(NOW)
-        self.assertEqual([e['ticket_status'] for e in entries], ['urgent', 'open', 'upcoming', 'ended'])
-        self.assertEqual([e['event_id'] for e in entries], ['another', 'feb-live', 'feb-live', 'feb-live'])
+        self.assertEqual([e['ticket_status'] for e in entries], ['urgent', 'open'])
+        self.assertEqual([e['event_id'] for e in entries], ['another', 'feb-live'])
         self.assertIn('2027/02/13', entries[1]['subtitle'])
         self.service.set_subscription('ticket', 'test:GroupMessage:42', True)
         with self.service.db._connect() as db:
@@ -129,7 +129,8 @@ class TicketSourceWorkflow(unittest.IsolatedAsyncioTestCase):
         await self.service.finish_reminders(claimed, False)
         self.assertEqual(await self.service.claim_due_reminders(NOW), [])
         stale, *_ = await self.service.ticket_entries(NOW)
-        self.assertIn('待核验', next(e for e in stale if e['event_id'] == 'another')['status_label'])
+        self.assertFalse(any(e['event_id'] == 'another' for e in stale))
+        self.assertEqual(next(r for r in self.service.db.ticket_query_rows() if r['event_id'] == 'another')['source_quality'], 'stale')
 
     async def test_news_discovers_missing_event_prioritizes_and_retains_public_number(self):
         news = {'_id': 99, 'path': '01_19969', 'title': 'noctchill LIVE チケット先行', 'updated': 123, 'brand': []}

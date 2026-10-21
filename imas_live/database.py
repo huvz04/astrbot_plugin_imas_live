@@ -681,7 +681,7 @@ class Database:
                     dict(db.execute('SELECT * FROM ticket_rounds WHERE id=?', (key,)).fetchone())) for old in known_entrances)}
             for round_id in candidate_ids:
                 row = current_tickets[round_id]
-                if row.ticket_scope == "onsite" and row.sale_method == "lottery":
+                if row.ticket_scope == "onsite" and row.sale_method in {"lottery", "resale"}:
                     db.execute("""INSERT OR IGNORE INTO ticket_new_rounds(round_id,event_id,source_url,observed_at)
                         VALUES(?,?,?,?)""", (round_id, event_id, source_url, stamp))
         self.reconcile_event_identities()
@@ -933,6 +933,37 @@ class Database:
             db.execute("INSERT INTO meta VALUES('ticket_new_ticket_channel_v1',?)", (json.dumps(identities),))
         return set(identities)
 
+    def recover_recent_resale_notices(self) -> None:
+        """Recover recent missed resale rounds once, without replaying coverage.
+
+        Old versions saved resale facts but excluded their notification queue.
+        Require a source baseline predating the explicit application start;
+        a newly covered old page cannot prove a missed notification.
+        """
+        stamp = now()
+        current = datetime.fromisoformat(stamp)
+        with self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM meta WHERE key='resale_notice_recovery_v1'").fetchone():
+                return
+            rows = db.execute('''SELECT t.*,b.baselined_at,b.source_url AS baseline_url
+                FROM ticket_rounds t JOIN ticket_source_baselines b ON b.event_id=t.event_id
+                AND b.source_url=COALESCE(t.verified_source_url,t.source_url)
+                WHERE t.ticket_scope='onsite' AND t.sale_method='resale' AND t.quality='verified' ''').fetchall()
+            for row in rows:
+                try:
+                    start, end, baseline = (datetime.fromisoformat(row[key])
+                        for key in ('application_start', 'application_end', 'baselined_at'))
+                except (ValueError, TypeError):
+                    continue
+                if not all(moment.tzinfo for moment in (start, end, baseline)):
+                    continue
+                if baseline < start and current-timedelta(hours=72) <= start <= current < end:
+                    db.execute('''INSERT OR IGNORE INTO ticket_new_rounds(round_id,event_id,source_url,observed_at)
+                        VALUES(?,?,?,?)''', (row['id'], row['event_id'], row['baseline_url'],
+                                             start.astimezone(timezone.utc).isoformat(timespec='seconds')))
+            db.execute("INSERT INTO meta VALUES('resale_notice_recovery_v1',?)", (stamp,))
+
     def subscription_enabled(self, kind: str, umo: str) -> bool:
         table = self._subscription_table(kind)
         with self._connect() as db:
@@ -1004,7 +1035,7 @@ class Database:
         with self._connect() as db: db.execute("UPDATE delivery_log SET state=?,updated_at=? WHERE dedupe_key=?", ("sent" if success else "failed",now(),key))
 
     def calendar_rows(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Return only concrete performance dates and verified lottery deadlines."""
+        """Return concrete performance dates and verified lottery/resale deadlines."""
         with self._connect() as db:
             performances = [dict(row) for row in db.execute("""SELECT p.*,e.title,e.brands_json,e.event_display,e.venue AS event_venue,
                 n.public_number,s.fetched_at AS source_fetched_at,s.quality AS source_quality FROM performances p JOIN events e ON e.id=p.event_id
@@ -1013,7 +1044,7 @@ class Database:
                     SELECT 1 FROM sources root WHERE root.event_id=e.id AND root.url=e.official_url)
                     THEN e.official_url ELSE p.source_url END
                 WHERE p.date IS NOT NULL AND p.status!='cancelled'""")]
-        deadlines = [row for row in self.ticket_query_rows() if row['sale_method'] == 'lottery' and row['application_end']]
+        deadlines = [row for row in self.ticket_query_rows() if row['application_end']]
         return performances, deadlines
 
     def ticket_performances(self) -> list[dict[str, Any]]:
@@ -1052,6 +1083,6 @@ class Database:
                 JOIN events e ON e.id=t.event_id
                 LEFT JOIN event_numbers n ON n.event_id=e.id
                 LEFT JOIN sources s ON s.event_id=q.event_id AND s.url=COALESCE(t.verified_source_url,q.source_url)
-                WHERE t.ticket_scope='onsite' AND t.sale_method='lottery' AND t.quality='verified'
+                WHERE t.ticket_scope='onsite' AND t.sale_method IN ('lottery','resale') AND t.quality='verified'
                 ORDER BY q.observed_at,q.round_id""").fetchall()
         return [dict(row) for row in rows]

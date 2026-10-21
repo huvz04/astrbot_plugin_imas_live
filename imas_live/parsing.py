@@ -347,8 +347,10 @@ def parse_ticket_page(html: str, source_url: str) -> ParsedPage:
                 if anchor:
                     link_label = clean(anchor.get_text(' '))
                     if link_label.startswith('http'):
+                        day_label = clean(str(anchor.previous_sibling or '')).rstrip(':')
                         seat_heading = anchor.parent.find_previous_sibling(['p', 'h3', 'h4'])
-                        link_label = clean(seat_heading.get_text(' ')) if seat_heading else ''
+                        link_label = day_label if re.fullmatch(r'\d{1,2}月\d{1,2}日\([^)]*\)公演', day_label) else (
+                            clean(seat_heading.get_text(' ')) if seat_heading else '')
             parsed.ticket_rounds.append(TicketRound(
                 stable_key=key, name=title + ('｜' + link_label if link_label else ''), ticket_scope=scope,
                 sale_method=_method(title + " " + whole[:300]),

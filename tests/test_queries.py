@@ -86,14 +86,8 @@ class QueryTests(unittest.TestCase):
             by_round = {entry["subtitle"].splitlines()[0]: entry for entry in entries}
             self.assertEqual(by_round["轮次：恰好24小时"]["ticket_status"], "urgent")
             self.assertEqual(by_round["轮次：开放超过窗口"]["ticket_status"], "open")
-            self.assertEqual(by_round["轮次：窗口内即将开始"]["ticket_status"], "upcoming")
-            self.assertEqual(by_round["轮次：尚未开始不能标开放"]["ticket_status"], "upcoming")
-            self.assertEqual(by_round["轮次：开始待核验"]["ticket_status"], "unknown")
-            self.assertEqual(by_round["轮次：陈旧缓存"]["ticket_status"], "stale")
-            self.assertIn("待核验", by_round["轮次：陈旧缓存"]["status_label"])
-            self.assertEqual(by_round["轮次：窗口外才开始"]["ticket_status"], "upcoming")
-            self.assertEqual(by_round["轮次：已经截止"]["ticket_status"], "ended")
-            self.assertEqual(len(entries), 8)
+            self.assertEqual(set(by_round), {'轮次：恰好24小时', '轮次：开放超过窗口'})
+            self.assertEqual(len(service.db.ticket_query_rows()), 8)
             self.assertIn("北京时间", by_round["轮次：恰好24小时"]["subtitle"])
             self.assertIn("JST", by_round["轮次：恰好24小时"]["subtitle"])
             asyncio.run(service.close())
@@ -104,9 +98,11 @@ class QueryTests(unittest.TestCase):
             evidence = Evidence("https://example.test/stale", "official", "test")
             add_event(service, "stale-only", (), [TicketRound("round", "仍开放但缓存旧", "onsite", "lottery", "2026-09-01T00:00+09:00", "2026-09-20T23:59+09:00", evidence=evidence)], source_quality="stale")
             entries, _, _, status = asyncio.run(service.ticket_entries(CURRENT))
-            self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0]['ticket_status'], 'stale')
-            self.assertEqual(entries[0]['status_label'], '抽选中 · 待核验')
+            self.assertEqual(entries, [])
+            number = service.db.detail('stale-only')['event']['public_number']
+            detail = asyncio.run(service.ticket_detail(number, CURRENT))
+            self.assertEqual(detail['tickets'][0]['ticket_status'], 'stale')
+            self.assertEqual(detail['tickets'][0]['status_label'], '抽选中 · 待核验')
             asyncio.run(service.close())
 
     def test_manual_ticket_query_rechecks_only_active_stale_official_pages(self):

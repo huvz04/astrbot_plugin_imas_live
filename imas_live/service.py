@@ -74,6 +74,7 @@ class ImasLiveService:
         # never copied to the newly introduced LIVE reminder table.
         self.db.migrate_legacy_ticket_subscriptions(self.config.get("white_umos", []))
         self._ticket_new_channel_baseline = self.db.migrate_ticket_new_channel()
+        self.db.recover_recent_resale_notices()
         self.client = OfficialCmsClient(float(self.config.get("request_timeout_seconds", 25)))
         self._sync_lock = asyncio.Lock()
         self.directory_ready = asyncio.Event()
@@ -803,7 +804,7 @@ class ImasLiveService:
             return False
 
     async def ticket_entries(self, current: datetime | None = None) -> tuple[list[dict[str, Any]], datetime, datetime, str]:
-        """Keep onsite lottery/resale rounds until the final LIVE session starts."""
+        """Show only freshly verified, currently accepting onsite rounds."""
         zone = ZoneInfo(str(self.config.get("display_timezone", "Asia/Shanghai")))
         current = (current or datetime.now(zone)).astimezone(zone)
         start, end, _ = self._month_window(current, None)
@@ -831,6 +832,8 @@ class ImasLiveService:
             application_start = self._ticket_moment(row.get("application_start"))
             deadline = self._ticket_moment(row.get("application_end"))
             ticket_status, status_label = self._ticket_display_status(row, current)
+            if ticket_status not in {'open', 'urgent'}:
+                continue
             details = [f"轮次：{row['name']}"]
             if application_start:
                 details.append(self._ticket_time(row["application_start"], "开始", zone))
@@ -1078,6 +1081,9 @@ class ImasLiveService:
         if not detail:
             return None
         event = detail["event"]
+        performances = detail['performances'] or [vars_for_slots(p) for p in schedule_performances(
+            event.get('event_display') or '', event.get('official_url') or '', event.get('venue'))]
+        live_pending = self._ticket_event_window(performances, current, zone)[0]
         tickets = [row for row in detail["tickets"] if row.get("ticket_scope") == "onsite"]
         evidence_rows = {row['id']: row for row in await asyncio.to_thread(self.db.ticket_query_rows)}
         result: list[dict[str, Any]] = []
@@ -1085,6 +1091,8 @@ class ImasLiveService:
             evidence_row = evidence_rows.get(row['id'], {**row,
                 'source_fetched_at': event.get('source_fetched_at'), 'source_quality': event.get('source_quality')})
             ticket_status, status = self._ticket_display_status(evidence_row, current)
+            deadline = self._ticket_moment(row.get('application_end'))
+            expired = not live_pending or bool(deadline and current >= deadline)
             if row["sale_method"] == "first_come":
                 status, ticket_status = "一般销售/先到先得", "unknown"
             details = [f"{status}｜{row['name']}"]
@@ -1092,7 +1100,7 @@ class ImasLiveService:
                 try: details.append(self._ticket_time(row["application_end"], "截止", zone))
                 except ValueError: details.append("截止时间待核验")
             result.append({"kind": "ticket", "title": event["title"], "subtitle": "\n".join(details),
-                           "brands": json.loads(event["brands_json"]), "url": row.get("url") or row.get("source_url"),
+                           "brands": json.loads(event["brands_json"]), "url": None if expired else row.get("url") or row.get("source_url"),
                            "ticket_status": ticket_status, "status_label": status,
                            "public_number": event["public_number"], "sort_time": row.get("application_end") or "", "source_fetched_at": evidence_row.get("source_fetched_at")})
         if not result:
@@ -1168,7 +1176,7 @@ class ImasLiveService:
             await asyncio.to_thread(self.db.finish_delivery, row["delivery_key"], success)
 
     async def claim_new_ticket_announcements(self, current: datetime | None = None) -> list[dict[str, Any]]:
-        """Claim newly verified onsite lottery rounds for ticket-subscribed groups.
+        """Claim added onsite lottery/resale rounds for ticket-subscribed groups.
 
         Candidate rows are written atomically with a successful special-page
         parse.  The source baseline rules live in the database, while this
@@ -1207,6 +1215,8 @@ class ImasLiveService:
                     status, ticket_status = "新抽选现已开放", "open"
             else:
                 status, ticket_status = "新抽选已公布／起止时间待核验", "unknown"
+            if row['sale_method'] == 'resale':
+                status = status.replace('新抽选', '新增转售')
             times: list[str] = []
             if start and start.tzinfo:
                 times.append(self._ticket_time(row["application_start"], "开始", zone))
